@@ -1346,7 +1346,15 @@ test("fast middle-page scroll settles with continuous mounted coverage", async (
   // Simulate a fast trackpad pass through several middle-page ranges, then
   // stop. The final evaluate emits the last scroll event; all coverage samples
   // after it are passive observations.
+  //
+  // A real trackpad pass starts with a wheel event, and that is what retires
+  // the virtualizer's bottom intent. Programmatic `scrollTop` writes are not
+  // reader input, so without it the prepend's extent resize can legitimately
+  // re-pin the floor mid-burst and the coverage read measures the wrong place.
   await timeline.evaluate((element) => {
+    element.dispatchEvent(
+      new WheelEvent("wheel", { deltaY: -1, bubbles: true }),
+    );
     const maxOffset = element.scrollHeight - element.clientHeight;
     for (const fraction of [0.72, 0.28, 0.64, 0.36, 0.58, 0.44, 0.52]) {
       element.scrollTop = maxOffset * fraction;
