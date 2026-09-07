@@ -783,7 +783,7 @@ impl AcpClient {
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
-        self.current_hard_deadline = Some(hard_deadline);
+        self.current_hard_deadline = (!max_duration.is_zero()).then_some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -1049,6 +1049,9 @@ impl AcpClient {
         let remaining = hard_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(AcpError::HardTimeout { silence: remaining });
+        }
         let result = self
             .read_until_response_with_idle_timeout(
                 session_id,
@@ -1349,11 +1352,14 @@ impl AcpClient {
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
+            let idle_fires_first = !idle_timeout.is_zero()
+                && (max_duration.is_zero() || idle_deadline < hard_deadline);
             let next_deadline = if idle_fires_first {
-                idle_deadline
+                Some(idle_deadline)
+            } else if !max_duration.is_zero() {
+                Some(hard_deadline)
             } else {
-                hard_deadline
+                None
             };
 
             // Pre-select deadline check — required by Max's review. Under
@@ -1363,7 +1369,7 @@ impl AcpClient {
             // producing output (see `acp.rs:608` for why the hard deadline
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
-            if Instant::now() >= next_deadline {
+            if next_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 if let Some((_, _, ack_tx)) = pending_steer.take() {
                     // Prompt is timing out — release the withheld event via
                     // PromptCompletedNeutral (no fallback signal: there is
@@ -1484,7 +1490,7 @@ impl AcpClient {
                     // response or the steer response next.
                     None
                 }
-                _ = tokio::time::sleep_until(next_deadline) => {
+                _ = tokio::time::sleep_until(next_deadline.unwrap_or(now)), if next_deadline.is_some() => {
                     // The pre-select check at the top of the next iteration
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
@@ -1634,7 +1640,9 @@ impl AcpClient {
                                             Some(_) => {
                                                 let renew_now = Instant::now();
                                                 let new_deadline = renew_now + max_duration;
-                                                if new_deadline > hard_deadline {
+                                                if !max_duration.is_zero()
+                                                    && new_deadline > hard_deadline
+                                                {
                                                     hard_deadline = new_deadline;
                                                     self.current_hard_deadline = Some(new_deadline);
                                                     tracing::info!(
@@ -3123,6 +3131,43 @@ mod tests {
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_turn_completes_after_elapsed_deadlines() {
+        let mut client =
+            spawn_script(r#"echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#)
+                .await;
+        let start = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_secs(3 * 3600)).await;
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "test",
+                42,
+                std::time::Duration::ZERO,
+                start,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn unlimited_session_prompt_round_trips_without_cancellation() {
+        let mut client = spawn_script(
+            r#"read -r request; echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'"#,
+        ).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "test",
+                "finish the work",
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(client.current_hard_deadline.is_none());
     }
 
     #[tokio::test]
