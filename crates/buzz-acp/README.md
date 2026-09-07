@@ -148,8 +148,8 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
-| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
-| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. `0` disables this deadline. |
+| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn. `0` disables this deadline. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
@@ -414,3 +414,11 @@ cleanup. `BUZZ_PRIVATE_KEY` remains available to the Buzz CLI; adapters do not
 receive the redundant `NOSTR_PRIVATE_KEY` variable. No global Git config is
 modified. Standalone `buzz-dev-mcp` supplies utility aliases only; a non-Buzz
 ACP client must supply any desired Git environment itself.
+
+## Supervised research turns
+
+For research workers whose lifetime is owned by the operator's service manager,
+set `BUZZ_ACP_MAX_TURN_DURATION=0` and `BUZZ_ACP_IDLE_TIMEOUT=0` to let a turn run
+until completion or explicit cancellation. Zero disables that deadline; positive
+values retain the existing timeout behavior. An unlimited turn retains its queue
+ownership until completion, cancellation, or a reported process failure.
