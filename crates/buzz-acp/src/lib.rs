@@ -19,6 +19,8 @@ mod relay;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
+mod reminder_receipts;
+mod reminders;
 mod scope;
 mod setup_mode;
 mod usage;
@@ -2854,6 +2856,14 @@ async fn run_harness(
         None
     };
     let mut heartbeat_in_flight = false;
+    let mut reminders = match reminders::Reminders::open(&ctx.rest_client) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            tracing::error!(%error, "reminder delivery disabled: cannot open durable receipts");
+            None
+        }
+    };
+    let (mut reminder_rx, reminder_poller) = reminders::start_polling(ctx.rest_client.clone());
 
     let mut presence_heartbeat = if config.presence_enabled {
         let interval = Duration::from_secs(60);
@@ -3000,6 +3010,16 @@ async fn run_harness(
     }
 
     loop {
+        if let Some(state) = reminders.as_mut() {
+            state.recover_missing_turn(pool.task_map().values().map(|meta| meta.turn_id.clone()));
+        }
+        let next_reminder = match reminders.as_ref().map(|state| state.next()).transpose() {
+            Ok(candidate) => candidate.flatten(),
+            Err(error) => {
+                tracing::error!(%error, "cannot read reminder receipts; delivery deferred");
+                None
+            }
+        };
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
@@ -3007,7 +3027,7 @@ async fn run_harness(
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
         if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+            lazy_wake_work_pending = queue.has_flushable_work() || next_reminder.is_some();
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -3134,6 +3154,22 @@ async fn run_harness(
                 observer.as_ref(),
             ) {
                 typing_channels.insert(scope, thread_tags);
+            }
+        }
+
+        if pool_ready && !queue.has_flushable_work() && !heartbeat_in_flight {
+            if let Some(reminder) = next_reminder {
+                if let Some(turn_id) = dispatch_private(
+                    &mut pool,
+                    &ctx,
+                    &mut heartbeat_in_flight,
+                    Some(reminder.clone()),
+                ) {
+                    if let Some(state) = reminders.as_mut() {
+                        state.started(turn_id, reminder);
+                    }
+                    last_activity = tokio::time::Instant::now();
+                }
             }
         }
 
@@ -3663,6 +3699,10 @@ async fn run_harness(
                     }
                     None
                 }
+                Some(heads) = reminder_rx.recv() => {
+                    if let Some(state) = reminders.as_mut() { state.refresh(heads); }
+                    None
+                }
                 _ = async {
                     match heartbeat.as_mut() {
                         Some(hb) => hb.tick().await,
@@ -3739,6 +3779,9 @@ async fn run_harness(
 
         match pool_event {
             Some(PoolEvent::Result(result)) => {
+                if let Some(state) = reminders.as_mut() {
+                    state.finished(&result.turn_id, &result.outcome);
+                }
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
@@ -4131,6 +4174,7 @@ async fn run_harness(
     }
 
     // Cancel any in-flight presence heartbeat before sending offline.
+    reminder_poller.abort();
     if let Some(h) = presence_task.take() {
         h.abort();
     }
@@ -4830,7 +4874,7 @@ fn handle_prompt_result(
 
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
-        PromptSource::Heartbeat => *heartbeat_in_flight = false,
+        PromptSource::Heartbeat | PromptSource::Reminder => *heartbeat_in_flight = false,
     }
 
     // Strip sessions for channels the agent was removed from while this
@@ -5223,13 +5267,21 @@ fn dispatch_heartbeat(
     ctx: &Arc<PromptContext>,
     heartbeat_in_flight: &mut bool,
 ) {
-    if *heartbeat_in_flight {
-        return;
+    if dispatch_private(pool, ctx, heartbeat_in_flight, None).is_some() {
+        tracing::info!("heartbeat_fired");
     }
-    let agent = match pool.try_claim(None) {
-        Some(a) => a,
-        None => return,
-    };
+}
+
+fn dispatch_private(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    heartbeat_in_flight: &mut bool,
+    reminder: Option<buzz_sdk::reminders::Reminder>,
+) -> Option<String> {
+    if *heartbeat_in_flight {
+        return None;
+    }
+    let agent = pool.try_claim(None)?;
 
     let prompt_text = ctx
         .heartbeat_prompt
@@ -5242,10 +5294,17 @@ fn dispatch_heartbeat(
     let task_turn_id = turn_id.clone();
 
     let abort_handle = pool.join_set.spawn(async move {
+        if let Some(reminder) = reminder {
+            reminders::run(agent, reminder, ctx_clone, result_tx, task_turn_id).await;
+            return;
+        }
         pool::run_prompt_task(
             agent,
             None,
-            Some(prompt_text),
+            Some(pool::PrivatePrompt {
+                text: prompt_text,
+                source: PromptSource::Heartbeat,
+            }),
             ctx_clone,
             result_tx,
             None,
@@ -5260,7 +5319,7 @@ fn dispatch_heartbeat(
             agent_index,
             channel_id: None,
             scope: None,
-            turn_id,
+            turn_id: turn_id.clone(),
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5268,7 +5327,7 @@ fn dispatch_heartbeat(
         },
     );
     *heartbeat_in_flight = true;
-    tracing::info!(agent = agent_index, "heartbeat_fired");
+    Some(turn_id)
 }
 
 #[cfg(test)]

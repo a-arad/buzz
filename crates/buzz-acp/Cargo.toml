@@ -16,6 +16,7 @@ name = "buzz-acp"
 path = "src/main.rs"
 
 [dependencies]
+fs2 = "0.4"
 # Internal
 buzz-core = { workspace = true }
 buzz-sdk = { workspace = true }
