@@ -268,11 +268,11 @@ pub struct CliArgs {
     pub mcp_command: String,
 
     /// Idle timeout: max seconds of silence before killing a turn.
-    /// Resets on any agent stdout activity.
+    /// Resets on any agent stdout activity. Zero disables the idle timeout.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
     pub idle_timeout: Option<u64>,
 
-    /// Absolute wall-clock cap per turn (safety valve).
+    /// Absolute wall-clock cap per turn. Zero disables the cap.
     #[arg(long, env = "BUZZ_ACP_MAX_TURN_DURATION", default_value_t = DEFAULT_MAX_TURN_DURATION_SECS)]
     pub max_turn_duration: u64,
 
@@ -1038,39 +1038,28 @@ impl Config {
 
         // Resolve idle_timeout_secs with deprecation handling.
         // Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `DEFAULT_IDLE_TIMEOUT_SECS`.
-        let idle_timeout_secs = {
-            let raw = match (args.idle_timeout, args.turn_timeout) {
-                (Some(idle), Some(_turn)) => {
-                    tracing::warn!(
-                        "--turn-timeout / BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored \
+        let idle_timeout_secs = match (args.idle_timeout, args.turn_timeout) {
+            (Some(idle), Some(_turn)) => {
+                tracing::warn!(
+                    "--turn-timeout / BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored \
                          when --idle-timeout / BUZZ_ACP_IDLE_TIMEOUT is also set"
-                    );
-                    idle
-                }
-                (Some(idle), None) => idle,
-                (None, Some(turn)) => {
-                    tracing::warn!(
-                        "--turn-timeout / BUZZ_ACP_TURN_TIMEOUT is deprecated; \
-                         use --idle-timeout / BUZZ_ACP_IDLE_TIMEOUT instead"
-                    );
-                    turn
-                }
-                (None, None) => DEFAULT_IDLE_TIMEOUT_SECS,
-            };
-            if raw == 0 {
-                tracing::warn!("idle timeout of 0 is invalid — using 1s minimum");
-                1
-            } else {
-                raw
+                );
+                idle
             }
+            (Some(idle), None) => idle,
+            (None, Some(turn)) => {
+                tracing::warn!(
+                    "--turn-timeout / BUZZ_ACP_TURN_TIMEOUT is deprecated; \
+                         use --idle-timeout / BUZZ_ACP_IDLE_TIMEOUT instead"
+                );
+                turn
+            }
+            (None, None) => DEFAULT_IDLE_TIMEOUT_SECS,
         };
 
         let max_turn_duration_secs = {
             let raw = args.max_turn_duration;
-            if raw == 0 {
-                tracing::warn!("max turn duration of 0 is invalid — using 60s minimum");
-                60
-            } else if raw > MAX_TURN_DURATION_CEILING_SECS {
+            if raw > MAX_TURN_DURATION_CEILING_SECS {
                 return Err(ConfigError::ConfigFile(format!(
                     "max_turn_duration ({}s) exceeds ceiling ({}s / 7 days)",
                     raw, MAX_TURN_DURATION_CEILING_SECS
@@ -1083,7 +1072,7 @@ impl Config {
         // idle_timeout must be strictly less than max_turn_duration. If idle_timeout
         // >= max_turn_duration, the absolute wall-clock cap would fire before the idle
         // timeout ever could, making idle_timeout a dead letter.
-        if idle_timeout_secs >= max_turn_duration_secs {
+        if max_turn_duration_secs != 0 && idle_timeout_secs >= max_turn_duration_secs {
             return Err(ConfigError::ConfigFile(format!(
                 "idle_timeout ({}s) must be less than max_turn_duration ({}s)",
                 idle_timeout_secs, max_turn_duration_secs
@@ -2498,19 +2487,39 @@ channels = "ALL"
         }
     }
 
-    /// Helper: resolve idle_timeout_secs using the same precedence logic as Config::from_args.
-    /// Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `DEFAULT_IDLE_TIMEOUT_SECS`.
     fn resolve_idle_timeout(idle: Option<u64>, turn: Option<u64>) -> u64 {
-        let raw = match (idle, turn) {
-            (Some(idle), Some(_)) => idle,
-            (Some(idle), None) => idle,
-            (None, Some(turn)) => turn,
-            (None, None) => DEFAULT_IDLE_TIMEOUT_SECS,
-        };
-        if raw == 0 {
-            1
-        } else {
-            raw
+        let mut argv = vec![
+            "buzz-acp".to_owned(),
+            "--private-key".to_owned(),
+            TEST_PRIVATE_KEY.to_owned(),
+        ];
+        if let Some(value) = idle {
+            argv.extend(["--idle-timeout".to_owned(), value.to_string()]);
+        }
+        if let Some(value) = turn {
+            argv.extend(["--turn-timeout".to_owned(), value.to_string()]);
+        }
+        Config::from_args(CliArgs::try_parse_from(argv).unwrap())
+            .unwrap()
+            .idle_timeout_secs
+    }
+
+    #[test]
+    fn zero_disables_each_deadline_independently() {
+        for (idle, max) in [(0, 0), (0, 60), (600, 0)] {
+            let args = CliArgs::try_parse_from([
+                "buzz-acp",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--idle-timeout",
+                &idle.to_string(),
+                "--max-turn-duration",
+                &max.to_string(),
+            ])
+            .unwrap();
+            let config = Config::from_args(args).unwrap();
+            assert_eq!(config.idle_timeout_secs, idle);
+            assert_eq!(config.max_turn_duration_secs, max);
         }
     }
 
@@ -2530,13 +2539,13 @@ channels = "ALL"
     }
 
     #[test]
-    fn idle_timeout_zero_clamped_to_one() {
-        assert_eq!(resolve_idle_timeout(Some(0), None), 1);
+    fn idle_timeout_zero_disables_deadline() {
+        assert_eq!(resolve_idle_timeout(Some(0), None), 0);
     }
 
     #[test]
-    fn idle_timeout_zero_from_deprecated_clamped_to_one() {
-        assert_eq!(resolve_idle_timeout(None, Some(0)), 1);
+    fn idle_timeout_zero_from_deprecated_disables_deadline() {
+        assert_eq!(resolve_idle_timeout(None, Some(0)), 0);
     }
 
     #[test]
