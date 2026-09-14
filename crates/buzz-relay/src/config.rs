@@ -116,6 +116,8 @@ pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Optional deployment policy for private agent communication.
+    pub agent_communication: Option<crate::agent_communication::AgentCommunicationPolicy>,
     /// Address the relay HTTP/WebSocket server binds to.
     pub bind_addr: SocketAddr,
     /// Postgres database connection URL.
@@ -1224,6 +1226,7 @@ impl Config {
             uds_path,
             health_port,
             metrics_port,
+            agent_communication: crate::agent_communication::AgentCommunicationPolicy::from_env()?,
             pubkey_allowlist_enabled,
             require_relay_membership,
             huddle_audio_available,

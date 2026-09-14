@@ -6,6 +6,9 @@ mod admission;
 mod build_info;
 mod rejection;
 
+/// Operator-controlled private agent communication policy.
+pub mod agent_communication;
+
 /// REST API route handlers.
 pub mod api;
 /// WebSocket audio relay for huddle voice channels.
