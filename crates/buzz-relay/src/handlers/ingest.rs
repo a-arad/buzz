@@ -2025,6 +2025,8 @@ async fn ingest_event_inner(
         )));
     }
 
+    crate::agent_communication::validate_event(state, &event, &auth)?;
+
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
@@ -2300,6 +2302,17 @@ async fn ingest_event_inner(
                 state_for_request(tenant, auth.pubkey()),
             );
             auth_result.map_err(IngestError::Rejected)?;
+        }
+    }
+
+    if state.config.agent_communication.is_some() {
+        if let Some(channel) = channel_row.as_ref() {
+            crate::agent_communication::validate_channel(tenant, state, &event, channel, &auth)
+                .await?;
+        } else if channel_id.is_some() && kind_u32 != KIND_NIP29_CREATE_GROUP {
+            return Err(IngestError::Rejected(
+                "restricted: DM policy requires a resolved channel".into(),
+            ));
         }
     }
 

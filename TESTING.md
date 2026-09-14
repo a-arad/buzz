@@ -2,6 +2,9 @@
 
 ## Automated Tests
 
+The optional deployment DM policy has an authenticated HTTP/WebSocket regression
+recipe in [agent-dm-policy.md](docs/agent-dm-policy.md#regression-verification).
+
 ```bash
 just test-unit          # unit tests — no infrastructure needed
 just test               # unit + integration (starts Docker if needed)
