@@ -1,0 +1,65 @@
+name: Publish tested relay artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release containing relay-image.tar"
+        required: true
+        type: string
+      archive_sha256:
+        description: "Verified SHA-256 of relay-image.tar"
+        required: true
+        type: string
+      manifest_digest:
+        description: "Verified image manifest digest, including sha256:"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-tested-relay
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+      MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
+    steps:
+      - name: Validate publication inputs
+        run: |
+          [[ "$RELEASE_TAG" =~ ^axes-relay-[A-Za-z0-9._-]+$ ]]
+          [[ "$ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$MANIFEST_DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+      - name: Install registry copy tool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
+      - name: Download and verify tested release artifact
+        working-directory: ${{ runner.temp }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern relay-image.tar
+          printf '%s  relay-image.tar\n' "$ARCHIVE_SHA256" | sha256sum --check --strict
+          skopeo inspect --raw oci-archive:relay-image.tar > source-manifest.json
+          printf '%s  source-manifest.json\n' "${MANIFEST_DIGEST#sha256:}" | sha256sum --check --strict
+      - name: Publish without rebuilding or changing the image
+        working-directory: ${{ runner.temp }}
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          printf '%s' "$GH_TOKEN" | skopeo login --username "$GITHUB_ACTOR" --password-stdin ghcr.io
+          skopeo copy --preserve-digests --digestfile published-digest.txt \
+            oci-archive:relay-image.tar "docker://${IMAGE}:${RELEASE_TAG}"
+          test "$(cat published-digest.txt)" = "$MANIFEST_DIGEST"
+          skopeo inspect --raw "docker://${IMAGE}@${MANIFEST_DIGEST}" > published-manifest.json
+          printf '%s  published-manifest.json\n' "${MANIFEST_DIGEST#sha256:}" | sha256sum --check --strict
+          printf 'Published tested artifact: `%s@%s`\n' "$IMAGE" "$MANIFEST_DIGEST" >> "$GITHUB_STEP_SUMMARY"
