@@ -332,6 +332,10 @@ async fn handle_dm_open(
         }
     }
 
+    if let Some(policy) = state.config.agent_communication.as_ref() {
+        policy.check_participants(&all_bytes)?;
+    }
+
     // Persist the command event (idempotency) — returns open transaction
     let tx = match persist_command_event(&state.db, tenant, event, None).await? {
         PersistResult::Duplicate => {
@@ -492,6 +496,10 @@ async fn handle_dm_add_member(
         return Err(IngestError::Rejected(
             "invalid: DM supports at most 9 participants".into(),
         ));
+    }
+
+    if let Some(policy) = state.config.agent_communication.as_ref() {
+        policy.check_participants(&all_bytes)?;
     }
 
     // Persist the command event — returns open transaction
