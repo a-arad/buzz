@@ -1,9 +1,5 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import {
-  activateRateLimit,
-  parseRateLimitHint,
-} from "@/shared/api/relayRateLimitGate";
-import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
@@ -12,7 +8,6 @@ import type {
   AddChannelMembersResult,
   BackendProviderCandidate,
   BackendProviderProbeResult,
-  CanvasResponse,
   GetHomeFeedInput,
   HomeFeedResponse,
   ManagedAgent,
@@ -25,8 +20,6 @@ import type {
   RelayEvent,
   SearchMessagesInput,
   SearchMessagesResponse,
-  SetCanvasInput,
-  SetCanvasResult,
   ThreadCursor,
   ThreadRepliesResponse,
   CreateManagedAgentInput,
@@ -42,6 +35,11 @@ import type {
 } from "@/shared/api/types";
 
 export * from "@/shared/api/tauriChannels";
+export {
+  getCanvas,
+  getCanvasHistory,
+  setCanvas,
+} from "@/shared/api/tauriCanvas";
 export { sendChannelMessage } from "@/shared/api/tauriMessages";
 export { getEventById, getEventsByIds } from "@/shared/api/tauriEvents";
 
@@ -128,6 +126,7 @@ export type RawManagedAgent = {
   idle_timeout_seconds: number | null;
   max_turn_duration_seconds: number | null;
   parallelism: number;
+  session_policy?: ManagedAgent["sessionPolicy"];
   system_prompt: string | null;
   avatar_url?: string | null;
   model: string | null;
@@ -233,17 +232,6 @@ type RawListRelayMembersResponse = {
   members: RawRelayMember[];
 };
 
-type RawCanvasResponse = {
-  content: string | null;
-  updated_at: number | null;
-  author: string | null;
-};
-
-type RawSetCanvasResult = {
-  ok: boolean;
-  event_id: string;
-};
-
 /** Error normalized from a rejected Tauri invocation with its wire payload. */
 export class TauriInvokeError extends Error {
   readonly payload: unknown;
@@ -280,18 +268,6 @@ function toTauriError(error: unknown): Error {
   }
 }
 
-/**
- * Inspect a Tauri error message and activate the shared rate-limit gate when
- * the Rust relay layer emitted an HTTP 429 response (`relay rate-limited:` prefix).
- *
- * Extracted so it can be unit-tested without mocking the Tauri invoke bridge.
- */
-export function applyTauriRateLimitIfNeeded(message: string): void {
-  if (message.startsWith("relay rate-limited:")) {
-    activateRateLimit(parseRateLimitHint(message));
-  }
-}
-
 export async function invokeTauri<T>(
   command: string,
   args?: Record<string, unknown>,
@@ -299,11 +275,9 @@ export async function invokeTauri<T>(
   try {
     return await tauriInvoke<T>(command, args);
   } catch (error) {
-    const err = toTauriError(error);
-    // Rust emits `relay rate-limited:` for HTTP 429 responses. Activate the
-    // shared gate so the TS relay client backs off for the same window.
-    applyTauriRateLimitIfNeeded(err.message);
-    throw err;
+    // HTTP backoff lives in Rust. Do not apply its separate ApiCalls quota
+    // to the WebSocket gate, but preserve the failure for the caller.
+    throw toTauriError(error);
   }
 }
 
@@ -398,33 +372,6 @@ export async function joinChannel(channelId: string): Promise<void> {
 
 export async function leaveChannel(channelId: string): Promise<void> {
   await invokeTauri("leave_channel", { channelId });
-}
-
-export async function getCanvas(channelId: string): Promise<CanvasResponse> {
-  const response = await invokeTauri<RawCanvasResponse>("get_canvas", {
-    channelId,
-  });
-  return {
-    content: response.content,
-    // Normalize absent keys to null: ensureWelcomeCanvas treats null as
-    // "no canvas yet", and `undefined !== null` would make every fresh
-    // channel look already-seeded.
-    updatedAt: response.updated_at ?? null,
-    author: response.author ?? null,
-  };
-}
-
-export async function setCanvas(
-  input: SetCanvasInput,
-): Promise<SetCanvasResult> {
-  const response = await invokeTauri<RawSetCanvasResult>("set_canvas", {
-    channelId: input.channelId,
-    content: input.content,
-  });
-  return {
-    ok: response.ok,
-    eventId: response.event_id,
-  };
 }
 
 export async function getHomeFeed(
@@ -642,6 +589,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     idleTimeoutSeconds: agent.idle_timeout_seconds,
     maxTurnDurationSeconds: agent.max_turn_duration_seconds,
     parallelism: agent.parallelism,
+    sessionPolicy: agent.session_policy ?? "channel",
     systemPrompt: agent.system_prompt,
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
