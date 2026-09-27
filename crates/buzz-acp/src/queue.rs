@@ -257,8 +257,11 @@ impl EventQueue {
     /// Set the in-flight backstop deadline from the configured max turn
     /// duration, preserving the 100s buffer for cancel-drain grace + respawn.
     pub fn with_in_flight_deadline(mut self, max_turn_duration_secs: u64) -> Self {
-        self.in_flight_deadline =
-            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+        self.in_flight_deadline = if max_turn_duration_secs == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS)
+        };
         self
     }
 
@@ -271,6 +274,10 @@ impl EventQueue {
     /// a deadline.
     pub fn extend_in_flight_deadline<K: IntoScope>(&mut self, scope: K, max_turn_secs: u64) {
         let scope = scope.into_scope();
+        if max_turn_secs == 0 {
+            self.in_flight_deadlines.remove(&scope);
+            return;
+        }
         if let Some(current) = self.in_flight_deadlines.get_mut(&scope) {
             let extended = Instant::now()
                 + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
@@ -430,8 +437,10 @@ impl EventQueue {
                         let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
                         let cancel_reason = self.cancel_reasons.remove(&scope);
                         self.in_flight_scopes.insert(scope.clone());
-                        self.in_flight_deadlines
-                            .insert(scope.clone(), now + self.in_flight_deadline);
+                        if !self.in_flight_deadline.is_zero() {
+                            self.in_flight_deadlines
+                                .insert(scope.clone(), now + self.in_flight_deadline);
+                        }
                         self.in_flight_batch_sizes
                             .insert(scope.clone(), cancelled.len());
                         return Some(FlushBatch {
@@ -471,8 +480,10 @@ impl EventQueue {
         }
 
         self.in_flight_scopes.insert(scope.clone());
-        self.in_flight_deadlines
-            .insert(scope.clone(), now + self.in_flight_deadline);
+        if !self.in_flight_deadline.is_zero() {
+            self.in_flight_deadlines
+                .insert(scope.clone(), now + self.in_flight_deadline);
+        }
         self.in_flight_batch_sizes
             .insert(scope.clone(), events.len());
 
@@ -780,6 +791,22 @@ impl EventQueue {
     /// events; under `thread` policy it counts distinct thread partitions.
     pub fn pending_channels(&self) -> usize {
         self.queues.len()
+    }
+
+    /// Whether `scope` still has work that can be reconstructed into a batch.
+    ///
+    /// Busy-owner hold timestamps are derived from pending queue state. Queue
+    /// cap eviction can retire a scope without going through a pool cleanup
+    /// path, so the dispatch loop uses this seam to prune orphaned holds before
+    /// scheduling their deadline wakeups.
+    pub(crate) fn has_pending_scope(&self, scope: &SessionScope) -> bool {
+        self.queues
+            .get(scope)
+            .is_some_and(|queue| !queue.is_empty())
+            || self
+                .cancelled_batches
+                .get(scope)
+                .is_some_and(|events| !events.is_empty())
     }
 
     /// Number of queued events for a specific scope (or channel, treated as its
@@ -1606,8 +1633,8 @@ fn format_context_hints(
     );
     let complete_conversation_context =
         conversation_context_status == ConversationContextStatus::Complete;
-    let conversation_context_had_delivered_events =
-        conversation_context_status == ConversationContextStatus::PreviouslyDelivered;
+    let conversation_context_had_session_events =
+        conversation_context_status == ConversationContextStatus::PreviouslyAvailable;
 
     // DM check comes first — a DM reply has both thread tags AND is_dm=true,
     // and the scope should be "dm" (not "thread") because the agent is in a DM.
@@ -1623,10 +1650,10 @@ fn format_context_hints(
             "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
         } else if has_conversation_context {
             "Conversation context included below. Use `buzz messages get --channel <UUID>` for full history if truncated."
-        } else if conversation_context_had_delivered_events && is_reply {
-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read the reply chain."
-        } else if conversation_context_had_delivered_events {
-            "Earlier conversation context was already delivered in this session. Use `buzz messages get --channel <UUID>` to re-read it."
+        } else if conversation_context_had_session_events && is_reply {
+            "Earlier thread context is already available in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read the reply chain."
+        } else if conversation_context_had_session_events {
+            "Earlier conversation context is already available in this session. Use `buzz messages get --channel <UUID>` to re-read it."
         } else if is_reply {
             "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch the reply chain."
         } else {
@@ -1659,8 +1686,8 @@ fn format_context_hints(
             "Thread context included below."
         } else if has_conversation_context {
             "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
-        } else if conversation_context_had_delivered_events {
-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read it."
+        } else if conversation_context_had_session_events {
+            "Earlier thread context is already available in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read it."
         } else {
             "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch thread context."
         };
@@ -1713,7 +1740,7 @@ fn format_context_hints(
 enum ConversationContextStatus {
     Complete,
     Included,
-    PreviouslyDelivered,
+    PreviouslyAvailable,
     Absent,
 }
 
@@ -1760,7 +1787,7 @@ fn conversation_context_covers_batch(
 fn conversation_context_status(
     batch: &FlushBatch,
     conversation_context: Option<&ConversationContext>,
-    conversation_context_had_delivered_events: bool,
+    conversation_context_had_session_events: bool,
 ) -> ConversationContextStatus {
     let window_is_complete = matches!(
         conversation_context,
@@ -1777,13 +1804,13 @@ fn conversation_context_status(
 
     if window_is_complete
         && conversation_context_covers_batch(batch, conversation_context)
-        && !conversation_context_had_delivered_events
+        && !conversation_context_had_session_events
     {
         ConversationContextStatus::Complete
     } else if conversation_context.is_some() {
         ConversationContextStatus::Included
-    } else if conversation_context_had_delivered_events {
-        ConversationContextStatus::PreviouslyDelivered
+    } else if conversation_context_had_session_events {
+        ConversationContextStatus::PreviouslyAvailable
     } else {
         ConversationContextStatus::Absent
     }
@@ -1843,9 +1870,10 @@ pub struct FormatPromptArgs<'a> {
     pub huddle_instructions: Option<&'a str>,
     pub channel_info: Option<&'a PromptChannelInfo>,
     pub conversation_context: Option<&'a ConversationContext>,
-    /// True when delivery-delta filtering removed at least one event that this
-    /// live session had already received. Trigger-only context does not set it.
-    pub conversation_context_had_delivered_events: bool,
+    /// True when delta filtering removed context already available to this
+    /// live session, either as prior input or as the agent's own reply.
+    /// Trigger-only context does not set it.
+    pub conversation_context_had_session_events: bool,
     pub profile_lookup: Option<&'a PromptProfileLookup>,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
@@ -2040,7 +2068,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         conversation_context_status(
             batch,
             args.conversation_context,
-            args.conversation_context_had_delivered_events,
+            args.conversation_context_had_session_events,
         ),
         reply_anchor.as_deref(),
     ));
@@ -2224,6 +2252,21 @@ mod tests {
             received_at: Instant::now(),
             prompt_tag: "test".into(),
         }
+    }
+
+    #[test]
+    fn unlimited_turn_keeps_queue_ownership_until_completion() {
+        let mut queue = EventQueue::new(DedupMode::Queue).with_in_flight_deadline(0);
+        let channel = Uuid::new_v4();
+        queue.push(make_queued(channel, "first task"));
+        assert!(queue.flush_next().is_some());
+        queue.push(make_queued(channel, "follow-up"));
+        queue.extend_in_flight_deadline(channel, 0);
+        assert!(queue.in_flight_deadlines.is_empty());
+        assert!(queue.flush_next().is_none());
+        queue.mark_complete(channel);
+        let batch = queue.flush_next().unwrap();
+        assert_eq!(batch.events[0].event.content, "follow-up");
     }
 
     /// Build a QueuedEvent with a specific `received_at` offset from now.
@@ -2660,11 +2703,17 @@ mod tests {
     fn test_format_prompt_interrupt_framing() {
         let batch = make_merged_batch(Some(CancelReason::Interrupt));
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt));
+        let new_section_tag = format!("<{}>", framing.new_tag);
 
         // Interrupt framing: the new request supersedes the previous one.
         assert!(
-            prompt.contains("<new-request-supersedes-previous>"),
+            prompt.contains(&new_section_tag),
             "interrupt prompt should use supersede framing: {prompt}"
+        );
+        assert!(
+            include_str!("base_prompt.md").contains(&new_section_tag),
+            "base prompt should document the production interrupt tag: {new_section_tag}"
         );
         assert!(
             prompt.contains("<previous-request-interrupted-before-completion>"),
@@ -4147,7 +4196,7 @@ mod tests {
             &batch,
             &FormatPromptArgs {
                 conversation_context: Some(&ctx),
-                conversation_context_had_delivered_events: true,
+                conversation_context_had_session_events: true,
                 ..Default::default()
             },
         )
@@ -4632,18 +4681,18 @@ mod tests {
 
         let trigger_only_prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(trigger_only_prompt.contains("fetch thread context"));
-        assert!(!trigger_only_prompt.contains("already delivered in this session"));
+        assert!(!trigger_only_prompt.contains("already available in this session"));
 
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
-                conversation_context_had_delivered_events: true,
+                conversation_context_had_session_events: true,
                 ..Default::default()
             },
         )
         .join("\n\n");
 
-        assert!(prompt.contains("Earlier thread context was already delivered in this session"));
+        assert!(prompt.contains("Earlier thread context is already available in this session"));
         assert!(prompt.contains("buzz messages thread"));
         assert!(!prompt.contains("Thread context included below"));
         assert!(!prompt.contains("<thread-context"));
@@ -4679,20 +4728,20 @@ mod tests {
         )
         .join("\n\n");
         assert!(trigger_only_prompt.contains("for conversation context"));
-        assert!(!trigger_only_prompt.contains("already delivered in this session"));
+        assert!(!trigger_only_prompt.contains("already available in this session"));
 
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
                 channel_info: Some(&ci),
-                conversation_context_had_delivered_events: true,
+                conversation_context_had_session_events: true,
                 ..Default::default()
             },
         )
         .join("\n\n");
 
         assert!(
-            prompt.contains("Earlier conversation context was already delivered in this session")
+            prompt.contains("Earlier conversation context is already available in this session")
         );
         assert!(prompt.contains("buzz messages get"));
         assert!(!prompt.contains("Conversation context included below"));

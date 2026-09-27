@@ -22,6 +22,9 @@ use crate::usage::{
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Package and binary name used by Buzz's Pi ACP fork.
+pub(crate) const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -457,11 +460,32 @@ impl AcpClient {
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
     ) -> Result<Self, AcpError> {
+        Self::spawn_with_env(command, args, extra_env, has_generated_codex_config, &[]).await
+    }
+
+    /// Spawn with authoritative launch environment overrides. Unlike persona
+    /// defaults, these values take precedence over the inherited environment.
+    pub(crate) async fn spawn_with_env(
+        command: &str,
+        args: &[String],
+        extra_env: &[(String, String)],
+        has_generated_codex_config: bool,
+        launch_env: &[(String, String)],
+    ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
         let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
-            .stdin(Stdio::piped())
+        cmd.args(args);
+        if crate::config::normalize_agent_command_identity(command) == BUZZ_PI_ACP_NAME {
+            if !args.iter().any(|arg| arg == "--") {
+                cmd.arg("--");
+            }
+            // Desktop launches buzz-acp in the Buzz nest; adapters inherit that
+            // workspace. Keep managed skills tied to launch CWD across sessions.
+            cmd.arg("--skill")
+                .arg(std::env::current_dir()?.join(".agents/skills"));
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so agent logs are visible in the harness terminal.
             .stderr(Stdio::inherit())
@@ -516,6 +540,32 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
+        // The harness composes the entire Git config block once. It must replace
+        // inherited counts/PATH rather than mixing two independently indexed blocks.
+        for (name, value) in extra_env
+            .iter()
+            .filter(|(name, _)| crate::git::is_managed_env(name))
+        {
+            cmd.env(name, value);
+        }
+        // Git applies this older injection channel after GIT_CONFIG_COUNT.
+        // Keeping it would let an ambient user.name or signing setting win
+        // over the harness-owned agent identity in native shells.
+        cmd.env_remove("GIT_CONFIG_PARAMETERS");
+        cmd.env_remove("NOSTR_PRIVATE_KEY");
+        if extra_env.iter().any(|(name, _)| name == "GIT_CONFIG_COUNT") {
+            // Native shells inherit these overrides, while buzz-agent clears
+            // them for MCP. Let both paths use the harness's agent identity.
+            for name in [
+                "GIT_AUTHOR_NAME",
+                "GIT_AUTHOR_EMAIL",
+                "GIT_COMMITTER_NAME",
+                "GIT_COMMITTER_EMAIL",
+            ] {
+                cmd.env_remove(name);
+            }
+        }
+
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
@@ -534,6 +584,7 @@ impl AcpClient {
                 "codex" | "codex-acp" => Some(StandardAdapterKind::Codex),
                 _ => None,
             };
+        cmd.envs(launch_env.iter().cloned());
         let mut child = cmd.spawn()?;
 
         let stdin = child
@@ -637,14 +688,16 @@ impl AcpClient {
     ///
     /// - `None` — no system-prompt field in the request (legacy framing).
     /// - `Some(SystemPromptTransport::Field(text))` — bare `systemPrompt` field
-    ///   (ACP protocol v2, buzz-agent, goose unused).
+    ///   (ACP protocol v2, buzz-agent; goose unused).
+    /// - `Some(SystemPromptTransport::PiMeta(text))` — `_meta.systemPrompt`
+    ///   as a replacement string for the Buzz pi-acp fork.
     /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
     ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
     ///
     /// `session_title` rides in `_meta.sessionTitle` when `Some`; `_meta` is
     /// omitted entirely otherwise, since adapters may distinguish an absent
-    /// member from a null one. When both `ClaudeMeta` and `session_title` are
-    /// present the two `_meta` members are merged into a single object.
+    /// member from a null one. Metadata prompt transports and the title are
+    /// merged into a single object.
     ///
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
     /// to pull model info from the raw result.
@@ -663,6 +716,9 @@ impl AcpClient {
             Some(SystemPromptTransport::Field(sp)) => {
                 params["systemPrompt"] = serde_json::Value::String(sp.to_owned());
             }
+            Some(SystemPromptTransport::PiMeta(sp)) => {
+                params["_meta"]["systemPrompt"] = serde_json::Value::String(sp.to_owned());
+            }
             Some(SystemPromptTransport::ClaudeMeta(sp)) => {
                 // Merge into _meta so sessionTitle (set below) is not clobbered.
                 params["_meta"]["systemPrompt"] = serde_json::json!({ "append": sp });
@@ -670,7 +726,7 @@ impl AcpClient {
             None => {}
         }
         if let Some(title) = session_title {
-            // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
+            // Merge — _meta may already carry a system prompt from an adapter extension.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
         let result = self.send_request("session/new", params).await?;
@@ -783,7 +839,7 @@ impl AcpClient {
     ) -> Result<StopReason, AcpError> {
         let params = build_prompt_params(session_id, prompt_blocks);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
-        self.current_hard_deadline = Some(hard_deadline);
+        self.current_hard_deadline = (!max_duration.is_zero()).then_some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -1049,6 +1105,9 @@ impl AcpClient {
         let remaining = hard_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(AcpError::HardTimeout { silence: remaining });
+        }
         let result = self
             .read_until_response_with_idle_timeout(
                 session_id,
@@ -1349,11 +1408,14 @@ impl AcpClient {
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
+            let idle_fires_first = !idle_timeout.is_zero()
+                && (max_duration.is_zero() || idle_deadline < hard_deadline);
             let next_deadline = if idle_fires_first {
-                idle_deadline
+                Some(idle_deadline)
+            } else if !max_duration.is_zero() {
+                Some(hard_deadline)
             } else {
-                hard_deadline
+                None
             };
 
             // Pre-select deadline check — required by Max's review. Under
@@ -1363,7 +1425,7 @@ impl AcpClient {
             // producing output (see `acp.rs:608` for why the hard deadline
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
-            if Instant::now() >= next_deadline {
+            if next_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 if let Some((_, _, ack_tx)) = pending_steer.take() {
                     // Prompt is timing out — release the withheld event via
                     // PromptCompletedNeutral (no fallback signal: there is
@@ -1484,7 +1546,7 @@ impl AcpClient {
                     // response or the steer response next.
                     None
                 }
-                _ = tokio::time::sleep_until(next_deadline) => {
+                _ = tokio::time::sleep_until(next_deadline.unwrap_or(now)), if next_deadline.is_some() => {
                     // The pre-select check at the top of the next iteration
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
@@ -1634,7 +1696,9 @@ impl AcpClient {
                                             Some(_) => {
                                                 let renew_now = Instant::now();
                                                 let new_deadline = renew_now + max_duration;
-                                                if new_deadline > hard_deadline {
+                                                if !max_duration.is_zero()
+                                                    && new_deadline > hard_deadline
+                                                {
                                                     hard_deadline = new_deadline;
                                                     self.current_hard_deadline = Some(new_deadline);
                                                     tracing::info!(
@@ -2131,9 +2195,9 @@ pub struct SessionNewResponse {
 
 /// How to deliver a system prompt on `session/new`.
 ///
-/// The two variants match the two mechanisms supported by current adapters:
-///
 /// - **`Field`** — bare `systemPrompt` field (ACP protocol v2, buzz-agent).
+/// - **`PiMeta`** — `_meta.systemPrompt: text`, used by the Buzz pi-acp fork
+///   to replace Pi's native system prompt.
 /// - **`ClaudeMeta`** — `_meta.systemPrompt: {"append": text}`, used by
 ///   `claude-agent-acp` to append to the adapter's own native system prompt
 ///   while keeping its tool-use preset intact.
@@ -2141,6 +2205,8 @@ pub struct SessionNewResponse {
 pub enum SystemPromptTransport<'a> {
     /// Deliver as a bare top-level `systemPrompt` field.
     Field(&'a str),
+    /// Deliver as `_meta.systemPrompt: text`.
+    PiMeta(&'a str),
     /// Deliver as `_meta.systemPrompt: {"append": text}`.
     ClaudeMeta(&'a str),
 }
@@ -3125,6 +3191,43 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_turn_completes_after_elapsed_deadlines() {
+        let mut client =
+            spawn_script(r#"echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#)
+                .await;
+        let start = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_secs(3 * 3600)).await;
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "test",
+                42,
+                std::time::Duration::ZERO,
+                start,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn unlimited_session_prompt_round_trips_without_cancellation() {
+        let mut client = spawn_script(
+            r#"read -r request; echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'"#,
+        ).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "test",
+                "finish the work",
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(client.current_hard_deadline.is_none());
+    }
+
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script("sleep 10").await;
@@ -3631,123 +3734,7 @@ mod tests {
 
     // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
 
-    #[tokio::test]
-    async fn session_new_full_sends_claude_meta_system_prompt_when_claude_meta_transport() {
-        // When ClaudeMeta transport is requested, the prompt must appear as
-        // _meta.systemPrompt: {"append": text} — never as a bare systemPrompt field.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_claude","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
-        let mut client = spawn_script(script).await;
-        client
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-
-        let resp = client
-            .session_new_full(
-                "/tmp",
-                vec![],
-                Some(SystemPromptTransport::ClaudeMeta("Be concise")),
-                None,
-            )
-            .await
-            .expect("session_new_full should succeed");
-
-        let received = &resp.raw["_receivedRequest"];
-        assert!(
-            received["params"].get("systemPrompt").is_none(),
-            "bare systemPrompt must not be present for ClaudeMeta transport"
-        );
-        assert_eq!(
-            received["params"]["_meta"]["systemPrompt"]["append"].as_str(),
-            Some("Be concise"),
-            "_meta.systemPrompt.append must carry the prompt text"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_new_full_merges_claude_meta_and_session_title_into_single_meta_object() {
-        // Both ClaudeMeta prompt and session_title must coexist under _meta —
-        // the prompt must not clobber sessionTitle or vice versa.
-        let script = r#"
-            read -t 2 _init
-            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
-            read -t 2 REQ
-            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_merged","_receivedRequest":'"$REQ"'}}'
-            sleep 1
-        "#;
-        let mut client = spawn_script(script).await;
-        client
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-
-        let resp = client
-            .session_new_full(
-                "/tmp",
-                vec![],
-                Some(SystemPromptTransport::ClaudeMeta("Be concise")),
-                Some("Fizz · #buzz-dev"),
-            )
-            .await
-            .expect("session_new_full should succeed");
-
-        let received = &resp.raw["_receivedRequest"];
-        assert_eq!(
-            received["params"]["_meta"]["systemPrompt"]["append"].as_str(),
-            Some("Be concise"),
-            "_meta.systemPrompt.append must be present"
-        );
-        assert_eq!(
-            received["params"]["_meta"]["sessionTitle"].as_str(),
-            Some("Fizz · #buzz-dev"),
-            "_meta.sessionTitle must be present alongside systemPrompt"
-        );
-    }
-
-    // ── Goose-native steer scaffold (PR follow-up to #1160) ──────────────
-
-    /// Helper: spawn an inert `cat` subprocess so we have a real AcpClient
-    /// to drive `handle_session_update` against. `cat` never writes back,
-    /// which is fine — these tests don't read from the agent, they just
-    /// feed JSON into the parser.
-    async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[], false)
-            .await
-            .expect("spawn cat as inert client")
-    }
-
-    /// Build a `session/update` JSON-RPC notification carrying a
-    /// `session_info_update` with the given `_meta.goose.activeRunId` value.
-    /// Pass `None` to omit the `activeRunId` field entirely.
-    ///
-    /// `_meta` is nested inside the `update` object (per the ACP
-    /// `SessionInfoUpdate` schema), matching what goose and buzz-agent
-    /// emit on the wire.
-    fn session_info_update_msg(active_run_id: Option<serde_json::Value>) -> serde_json::Value {
-        let mut goose = serde_json::Map::new();
-        if let Some(v) = active_run_id {
-            goose.insert("activeRunId".to_string(), v);
-        }
-        let mut meta = serde_json::Map::new();
-        meta.insert("goose".to_string(), serde_json::Value::Object(goose));
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "test-session",
-                "update": {
-                    "sessionUpdate": "session_info_update",
-                    "_meta": serde_json::Value::Object(meta),
-                },
-            }
-        })
-    }
+    include!("acp/system_prompt_tests.rs");
 
     #[tokio::test]
     async fn active_run_id_sets_on_string() {

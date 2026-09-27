@@ -1,5 +1,10 @@
 # buzz-acp
 
+For one prepared local task, use **`buzz-acp run --task <path|->`**. See
+[Local task runner and version-1 task contract](TASKS.md). With no command,
+`buzz-acp` remains the conversational service.
+
+
 ACP harness that connects AI agents to Buzz. The harness listens for @mentions on the relay, prompts your agent, and the agent replies using the Buzz CLI.
 
 ```
@@ -22,6 +27,38 @@ Build:
 cargo build --release -p buzz-acp
 export PATH="$PWD/target/release:$PATH"
 ```
+
+## Private reminders
+
+Agents can schedule deferred follow-ups with `buzz reminders create --after 7d
+--note 'Inspect experiment X and decide whether to continue' --link
+'buzz://message?channel=<uuid>&id=<event>'`. `--at` accepts an absolute RFC3339
+time with timezone. `list`, `get`, `snooze`, `complete`, and `cancel` manage the
+author's encrypted NIP-ER state; no channel message is published automatically.
+
+On relays advertising NIP-ER and NIP-42, the harness queries the author's current
+reminder heads every 30 seconds, with paginated recovery and no creation-time
+lower bound. Due work uses the existing private session and agent pool after
+queued messages, without interrupting active work. It rechecks the head before
+dispatch, so snoozes and cancellations supersede waiting intent. The reminder
+note and target provide context when the originating session no longer exists.
+
+A normally completed turn gets a durable delivery receipt; the agent separately
+chooses whether to complete, snooze, or cancel the reminder. Pending reminders
+already delivered remain inspectable with `buzz reminders list`; they do not
+repeatedly wake the agent. Failed, interrupted, or limited turns remain eligible
+with per-version backoff. A crash before the receipt is durable can redeliver:
+agents should inspect their retained artifacts before repeating side effects.
+
+Receipts default to `$XDG_STATE_HOME/buzz-acp/reminders` or
+`$HOME/.local/state/buzz-acp/reminders`. Set `BUZZ_ACP_REMINDER_STATE_DIR` to a
+persistent volume in replaceable runtimes. Files are scoped by relay and author;
+an exclusive local lock prevents competing consumers sharing that directory.
+Keep one harness per identity; simultaneous devices do not have distributed
+exactly-once delivery. Losing receipts can redeliver pending reminders, while
+done/cancelled state remains on the relay. Bookmark reminders without a due time
+never wake an agent. Relays lacking the advertised private-read contract disable
+reminder recovery without changing ordinary messaging.
 
 ## Generating Keys
 
@@ -111,8 +148,8 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
-| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
-| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. `0` disables this deadline. |
+| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn. `0` disables this deadline. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
@@ -270,6 +307,10 @@ Forum event kinds:
 4. **Prompting** — When events are pending and no prompt is in flight for that channel, drains all queued events for the oldest channel into a single batched prompt via ACP `session/prompt`.
 5. **Agent response** — The agent processes the prompt and uses the Buzz CLI (`send_message`, `get_messages`, etc.) to interact with Buzz.
 6. **Recovery** — If the agent crashes, the harness respawns it. If the relay disconnects, the harness reconnects with a `since` filter to avoid missing events.
+   If the inbound queue overflows, the harness attempts replay for affected
+   subscriptions when capacity and relay quota permit, with at least five seconds
+   between attempts. Recovery depends on available relay history and the consumer
+   making progress; complete delivery is not guaranteed.
 
 Each channel has at most one prompt in flight. Multiple channels can be processed concurrently when agents > 1.
 
@@ -351,3 +392,33 @@ See the [root TESTING.md](../../TESTING.md) for the full integration testing gui
 ## License
 
 Apache-2.0
+
+## Git in coding runtimes
+
+The harness configures agent authorship, Nostr commit/tag signing, and Git
+credentials for native runtime shells and declared MCP servers. Author names
+use `BUZZ_ACP_DISPLAY_NAME` (sanitized, with an npub fallback); email retains
+the public key and relay host. Inherited author/committer name and email
+overrides are cleared so native shells use the same agent attribution as MCP.
+Credential helpers are scoped to the selected
+relay's `/git` URLs. Existing `GIT_CONFIG_*` entries are preserved before the
+harness's overrides, and the complete block is forwarded in `mcpServers[].env`
+for agents that clear their MCP child environment.
+
+`buzz-acp` includes both Git helpers as multicall personalities, so standalone
+and remote launches need no separate signer installation. The harness creates
+private helper aliases and a 0600 keyfile, keeps them alive across adapter
+respawns, and removes them when it exits normally or completes graceful
+shutdown. As with other temporary files, SIGKILL or a machine crash cannot run
+cleanup. `BUZZ_PRIVATE_KEY` remains available to the Buzz CLI; adapters do not
+receive the redundant `NOSTR_PRIVATE_KEY` variable. No global Git config is
+modified. Standalone `buzz-dev-mcp` supplies utility aliases only; a non-Buzz
+ACP client must supply any desired Git environment itself.
+
+## Supervised research turns
+
+For research workers whose lifetime is owned by the operator's service manager,
+set `BUZZ_ACP_MAX_TURN_DURATION=0` and `BUZZ_ACP_IDLE_TIMEOUT=0` to let a turn run
+until completion or explicit cancellation. Zero disables that deadline; positive
+values retain the existing timeout behavior. An unlimited turn retains its queue
+ownership until completion, cancellation, or a reported process failure.
