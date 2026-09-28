@@ -103,7 +103,7 @@ pub struct AgentModelCapabilities {
 }
 
 /// Successful deliveries associated with one live channel session.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct ChannelDeliveryState {
     /// Whether a legacy user message has successfully carried standing context.
     pub standing_context_sent: bool,
@@ -116,13 +116,15 @@ pub struct ChannelDeliveryState {
 ///
 /// Separated from `OwnedAgent` so the state machine is testable without
 /// spawning a real agent subprocess.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionState {
     /// session scope → session_id
+    #[serde(with = "crate::session_store::scope_map")]
     pub sessions: HashMap<SessionScope, String>,
     pub heartbeat_session: Option<String>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
+    #[serde(with = "crate::session_store::scope_map")]
     pub turn_counts: HashMap<SessionScope, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
@@ -130,6 +132,7 @@ pub struct SessionState {
     pub heartbeat_standing_context_sent: bool,
     /// session scope → rendered NIP-AE core prompt section, populated once at
     /// session creation per Tyler's spec (no mid-session refresh).
+    #[serde(with = "crate::session_store::scope_map")]
     pub core_sections: HashMap<SessionScope, String>,
     /// session scope → rendered `<channel-canvas>` metadata section.
     ///
@@ -137,15 +140,30 @@ pub struct SessionState {
     /// Absent when the channel has no canvas, the canvas content is blank, or the
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
+    #[serde(with = "crate::session_store::scope_map")]
     pub canvas_sections: HashMap<SessionScope, String>,
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
+    #[serde(with = "crate::session_store::scope_map")]
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    #[serde(skip)]
+    pub(crate) store: Option<Arc<crate::session_store::Store>>,
+    #[serde(skip)]
+    pub(crate) pending_loads: HashSet<String>,
+    #[serde(skip)]
+    pub(crate) store_error: Option<String>,
+    #[serde(default)]
+    pub(crate) turn_active: bool,
+    #[serde(default)]
+    pub(crate) model_override: Option<String>,
 }
 
 impl SessionState {
     /// Invalidate the session (and turn counter) for a specific prompt source.
     pub fn invalidate(&mut self, source: &PromptSource) {
+        if self.store.is_some() && self.turn_active {
+            return;
+        }
         match source {
             PromptSource::Channel(scope) => {
                 self.invalidate_scope(scope);
@@ -154,6 +172,7 @@ impl SessionState {
                 self.heartbeat_session = None;
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
+                self.persist_invalidation();
             }
         }
     }
@@ -161,11 +180,16 @@ impl SessionState {
     /// Invalidate a single session scope's session and turn counter.
     /// Returns `true` if the scope had an active session.
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
+        if self.store.is_some() && self.turn_active {
+            return false;
+        }
         self.turn_counts.remove(scope);
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
-        self.sessions.remove(scope).is_some()
+        let removed = self.sessions.remove(scope).is_some();
+        self.persist_invalidation();
+        removed
     }
 
     /// Invalidate every session scope belonging to `channel_id` (channel-wide
@@ -195,6 +219,12 @@ impl SessionState {
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
+        if self.store.is_some() {
+            self.pending_loads = self.sessions.values().cloned().collect();
+            self.pending_loads
+                .extend(self.heartbeat_session.iter().cloned());
+            return;
+        }
         self.sessions.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
@@ -935,7 +965,12 @@ impl AgentPool {
     }
 
     /// Return an agent to its slot after a task completes.
-    pub fn return_agent(&mut self, agent: OwnedAgent) {
+    pub fn return_agent(&mut self, mut agent: OwnedAgent) {
+        agent.state.model_override = agent
+            .model_overridden
+            .then(|| agent.desired_model.clone())
+            .flatten();
+        agent.state.persist_invalidation();
         let idx = agent.index;
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
@@ -2102,10 +2137,21 @@ fn send_prompt_result(
     turn_id: &str,
     mut agent: OwnedAgent,
     source: PromptSource,
-    outcome: PromptOutcome,
+    mut outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    if matches!(outcome, PromptOutcome::Ok(_) | PromptOutcome::Cancelled) {
+        agent.state.turn_active = false;
+    }
+    agent.state.model_override = agent
+        .model_overridden
+        .then(|| agent.desired_model.clone())
+        .flatten();
+    if let Err(error) = agent.state.checkpoint() {
+        agent.state.store_error = Some(error.to_string());
+        outcome = PromptOutcome::Error(AcpError::Protocol(error.to_string()));
+    }
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -2144,6 +2190,20 @@ pub async fn run_prompt_task(
             .map(|prompt| prompt.source.clone())
             .unwrap_or(PromptSource::Heartbeat),
     };
+    if agent.state.store.is_some() && (agent.state.turn_active || agent.state.store_error.is_some())
+    {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(AcpError::Protocol(
+                "conversation requires reconciliation before more work".into(),
+            )),
+            None,
+        );
+        return;
+    }
     let prompt_text = private_prompt.map(|prompt| prompt.text);
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
@@ -2500,6 +2560,43 @@ pub async fn run_prompt_task(
             }
         }
     };
+    if agent.state.pending_loads.contains(&session_id) {
+        match agent
+            .acp
+            .session_load(&session_id, &ctx.cwd, ctx.mcp_servers.clone())
+            .await
+        {
+            Ok(_) => {
+                agent.state.pending_loads.remove(&session_id);
+            }
+            Err(error) => {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    None,
+                );
+                return;
+            }
+        }
+    }
+    if agent.state.store.is_some() {
+        agent.state.turn_active = true;
+        if let Err(error) = agent.state.checkpoint() {
+            agent.state.store_error = Some(error.to_string());
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Error(AcpError::Protocol(error.to_string())),
+                None,
+            );
+            return;
+        }
+    }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),
@@ -6562,6 +6659,102 @@ mod tests {
             pubkey: "author".into(),
             timestamp: "2026-08-09T00:00:00Z".into(),
             content: content.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_loads_original_conversation_before_new_prompt_and_load_error_never_resets() {
+        for reject_load in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store_path = directory.path().join("sessions");
+            let capture = directory.path().join("wire.jsonl");
+            let mut state = SessionState::open(&store_path, 0, "identity").unwrap();
+            state.heartbeat_session = Some("same-native-conversation".into());
+            state.heartbeat_standing_context_sent = true;
+            state.checkpoint().unwrap();
+            drop(state);
+            let script = format!(
+                r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{}'
+  if [ "$count" -eq 0 ] && [ '{}' = true ]; then
+    printf '%s\n' '{{"id":0,"error":{{"code":-32000,"message":"history unavailable"}}}}'
+  else
+    printf '%s\n' "{{\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  fi
+  count=$((count + 1))
+done"#,
+                capture.display(),
+                reject_load
+            );
+            let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+                .await
+                .unwrap();
+            let agent = OwnedAgent {
+                index: 0,
+                acp,
+                state: SessionState::open(&store_path, 0, "identity").unwrap(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
+                agent_name: "legacy-test-agent".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            };
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.base_prompt = Some("must not resend standing instructions".into());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            run_prompt_task(
+                agent,
+                None,
+                Some(PrivatePrompt {
+                    text: "only the new follow-up".into(),
+                    source: PromptSource::Heartbeat,
+                }),
+                Arc::new(ctx),
+                tx,
+                None,
+                "restored-turn".into(),
+            )
+            .await;
+            let mut result = rx.recv().await.unwrap();
+            result.agent.acp.shutdown().await;
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(requests[0]["method"], "session/load");
+            assert_eq!(
+                requests[0]["params"]["sessionId"],
+                "same-native-conversation"
+            );
+            if reject_load {
+                assert_eq!(requests.len(), 1);
+                assert!(matches!(result.outcome, PromptOutcome::Error(_)));
+            } else {
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[1]["method"], "session/prompt");
+                assert_eq!(
+                    requests[1]["params"]["sessionId"],
+                    "same-native-conversation"
+                );
+                assert!(!requests[1].to_string().contains("must not resend"));
+                assert!(matches!(result.outcome, PromptOutcome::Ok(_)));
+            }
+            assert_eq!(
+                result.agent.state.heartbeat_session.as_deref(),
+                Some("same-native-conversation")
+            );
+            drop(result);
+            let restored = SessionState::open(&store_path, 0, "identity").unwrap();
+            assert_eq!(
+                restored.heartbeat_session.as_deref(),
+                Some("same-native-conversation")
+            );
         }
     }
 

@@ -685,6 +685,22 @@ impl AcpClient {
         })
     }
 
+    /// Restore an existing ACP session without submitting or replaying a prompt.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.send_request(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers,
+            }),
+        )
+        .await
+    }
+
     /// Send `session/new` and return only the `sessionId` string.
     ///
     /// Convenience wrapper around [`session_new_full`].
