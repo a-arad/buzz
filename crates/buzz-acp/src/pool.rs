@@ -1261,6 +1261,7 @@ impl AgentPool {
 
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
+        agent.state.model_override = agent.desired_model.clone();
         // Carry the pick's correlator so a deferred-validation miss on the next
         // turn's session creation emits a late frame the Desktop can match.
         agent.desired_model_request_id = request_id;
@@ -10632,6 +10633,9 @@ done"#
         });
         let acp = spawn_switch_acp(OPTS_MODEL_A_AND_B, r#""result":{}"#).await;
         let mut agent = switching_agent(acp, "model-a");
+        let directory = tempfile::tempdir().unwrap();
+        agent.state =
+            SessionState::open(&directory.path().join("sessions"), 0, "idle-switch").unwrap();
         for scope in &scopes {
             agent
                 .state
@@ -10661,6 +10665,11 @@ done"#
         );
         let agent = pool.agents[0].as_ref().unwrap();
         assert_eq!(agent.desired_model.as_deref(), Some("model-b"));
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("sessions/0.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["state"]["model_override"], "model-b");
         assert!(!agent.state.sessions.contains_key(&scopes[0]));
         assert!(!pool.session_owners.contains_key(&scopes[0]));
         assert!(
