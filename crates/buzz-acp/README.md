@@ -389,3 +389,25 @@ set `BUZZ_ACP_MAX_TURN_DURATION=0` and `BUZZ_ACP_IDLE_TIMEOUT=0` to let a turn r
 until completion or explicit cancellation. Zero disables that deadline; positive
 values retain the existing timeout behavior. An unlimited turn retains its queue
 ownership until completion, cancellation, or a reported process failure.
+
+### Restart-safe conversations
+
+`BUZZ_ACP_SESSION_STORE=/private/role/sessions` opts a supervised harness into
+private, atomic conversation checkpoints. Commission a separate directory for
+each identity. The checkpoint binds the relay, public identity, session policy,
+and pool slot; another process cannot own the same slot concurrently. The adapter
+must support ACP `session/load` and retain its own native-session references.
+
+An idle restart restores channel/thread and heartbeat sessions, delivered-event
+IDs, standing instructions, turn counters, and model override. Loading never
+submits a prompt. A missing native history or failed load is an error, with no
+new-session fallback. An interrupted turn or unreadable checkpoint requires
+operator reconciliation; the harness does not infer completion or replay work.
+Explicit idle resets retain their usual meaning. Automatic rotation during an
+uncertain turn is suppressed to retain the original conversation evidence.
+
+For an already running legacy harness, enabling this option alone cannot recover
+its in-memory mappings. Reconstruct and verify the exact identity/scope/session
+references and delivery state from retained local evidence before the first idle
+restart. If any reference is ambiguous, leave that service running until resolved.
+Keep reminder receipts, native histories, workspaces, and provider settings intact.
