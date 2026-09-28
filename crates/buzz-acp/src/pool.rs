@@ -863,13 +863,25 @@ impl AgentPool {
     /// the index invariant.
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let session_owners = slots
+            .iter()
+            .flatten()
+            .flat_map(|agent| {
+                agent
+                    .state
+                    .sessions
+                    .keys()
+                    .cloned()
+                    .map(|scope| (scope, agent.index))
+            })
+            .collect();
         Self {
             agents: slots,
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
-            session_owners: HashMap::new(),
+            session_owners,
             held_since: HashMap::new(),
         }
     }
@@ -3029,6 +3041,7 @@ pub async fn run_prompt_task(
                             .await
                         {
                             Ok(stop_reason) => {
+                                agent.state.turn_active = false;
                                 log_stop_reason(&source, &stop_reason);
                                 agent.state.invalidate(&source);
                                 let retry_batch =
@@ -3120,6 +3133,7 @@ pub async fn run_prompt_task(
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
+                        agent.state.turn_active = false;
                         log_stop_reason(&source, &StopReason::EndTurn);
                         if let PromptSource::Channel(scope) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
@@ -3162,6 +3176,7 @@ pub async fn run_prompt_task(
 
     match prompt_result {
         Ok(stop_reason) => {
+            agent.state.turn_active = false;
             log_stop_reason(&source, &stop_reason);
 
             if let PromptSource::Channel(scope) = &source {
@@ -6665,7 +6680,7 @@ mod tests {
 
     #[tokio::test]
     async fn restart_loads_original_conversation_before_new_prompt_and_load_error_never_resets() {
-        for reject_load in [false, true] {
+        for (reject_load, rotate) in [(false, false), (true, false), (false, true)] {
             let directory = tempfile::tempdir().unwrap();
             let store_path = directory.path().join("sessions");
             let capture = directory.path().join("wire.jsonl");
@@ -6707,6 +6722,7 @@ done"#,
             };
             let mut ctx = make_prompt_context_no_owner();
             ctx.base_prompt = Some("must not resend standing instructions".into());
+            ctx.max_turns_per_session = u32::from(rotate);
             let (tx, mut rx) = mpsc::unbounded_channel();
             run_prompt_task(
                 agent,
@@ -6748,13 +6764,13 @@ done"#,
             }
             assert_eq!(
                 result.agent.state.heartbeat_session.as_deref(),
-                Some("same-native-conversation")
+                (!rotate).then_some("same-native-conversation")
             );
             drop(result);
             let restored = SessionState::open(&store_path, 0, "identity").unwrap();
             assert_eq!(
                 restored.heartbeat_session.as_deref(),
-                Some("same-native-conversation")
+                (!rotate).then_some("same-native-conversation")
             );
         }
     }
@@ -10644,6 +10660,8 @@ done"#
         }
         let original_sessions = agent.state.sessions.clone();
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        assert_eq!(pool.session_owners.get(&scopes[0]), Some(&0));
+        assert_eq!(pool.session_owners.get(&scopes[1]), Some(&0));
         assert_eq!(
             pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into())),
             IdleSwitchResult::AmbiguousTarget,
