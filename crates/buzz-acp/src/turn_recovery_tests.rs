@@ -89,6 +89,15 @@ async fn lost_ack_recovers_on_quiet_restart_without_new_prompt_or_reminder_deliv
             assert!(result.agent.state.turn_active);
             assert!(result.agent.state.recovery_held);
             assert!(result.agent.state.recovered_reminders.is_empty());
+            assert!(matches!(
+                result.outcome,
+                PromptOutcome::Error(AcpError::AgentError { code: -32073, .. })
+            ));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(base.join("checkpoints/0.json")).unwrap())
+                    .unwrap();
+            assert_eq!(saved["state"]["recovery_held"], true);
+            assert_eq!(saved["state"]["pending_turn"]["attempt"], "same-attempt");
         } else {
             assert!(result.agent.state.pending_turn.is_none());
             assert!(!result.agent.state.turn_active);
