@@ -82,7 +82,7 @@ impl SessionState {
                         saved.version == 1 && saved.identity == identity,
                         "conversation checkpoint identity or version mismatch"
                     );
-                    anyhow::ensure!(!saved.state.turn_active,
+                    anyhow::ensure!(!saved.state.turn_active || saved.state.pending_turn.is_some(),
                     "interrupted conversation requires reconciliation; work will not be replayed");
                     saved.state
                 }

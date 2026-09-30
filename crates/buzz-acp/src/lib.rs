@@ -11,12 +11,14 @@ mod pool_lifecycle;
 mod prompt_framing;
 mod prompt_project;
 mod queue;
+mod recovery_wait;
 mod relay;
 mod reminder_receipts;
 mod reminders;
 mod scope;
 mod session_store;
 mod setup_mode;
+mod turn_recovery;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -3022,6 +3024,10 @@ async fn tokio_main() -> Result<()> {
         if let Some(state) = reminders.as_mut() {
             state.recover_missing_turn(pool.task_map().values().map(|meta| meta.turn_id.clone()));
         }
+        if let Some(state) = reminders.as_mut() {
+            pool.flush_recovered_reminders(state);
+        }
+        pool.dispatch_recoveries(&ctx);
         let next_reminder = match reminders.as_ref().map(|state| state.next()).transpose() {
             Ok(candidate) => candidate.flatten(),
             Err(error) => {
@@ -5291,6 +5297,7 @@ fn dispatch_private(
             Some(pool::PrivatePrompt {
                 text: prompt_text,
                 source: PromptSource::Heartbeat,
+                reminder: None,
             }),
             ctx_clone,
             result_tx,

@@ -52,6 +52,13 @@ impl Reminders {
         self.pending = heads;
     }
 
+    pub(super) fn recovered(&mut self, id: &str, event: &str) -> Result<()> {
+        self.receipts.record_parts(id, event)?;
+        self.delivered.insert(event.to_owned());
+        self.retries.remove(event);
+        Ok(())
+    }
+
     pub(super) fn next(&self) -> Result<Option<Reminder>> {
         if self.in_flight.is_some() {
             return Ok(None);
@@ -255,6 +262,7 @@ pub(super) async fn run(
                 Some(PrivatePrompt {
                     text: prompt(&reminder),
                     source: PromptSource::Reminder,
+                    reminder: Some((reminder.id.clone(), reminder.event_id.clone())),
                 }),
                 ctx,
                 result_tx,
