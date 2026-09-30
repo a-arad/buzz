@@ -32,6 +32,7 @@ impl SessionState {
             }
         }
         self.turn_active = false;
+        self.recovery_held = false;
         self.checkpoint()
     }
 }
@@ -104,9 +105,13 @@ pub(crate) async fn run(
         result => {
             agent.state.recovery_held = true;
             tracing::error!(attempt = %pending.attempt, session = %pending.session, ?result, "native_recovery_requires_attention");
-            PromptOutcome::Error(AcpError::Protocol(
-                "native recovery requires inspection; conversation retained".into(),
-            ))
+            if let Err(error) = agent.state.checkpoint() {
+                agent.state.store_error = Some(error.to_string());
+            }
+            PromptOutcome::Error(AcpError::AgentError {
+                code: -32073,
+                message: "native recovery requires inspection; conversation retained".into(),
+            })
         }
     };
     let _ = result_tx.send(PromptResult {
