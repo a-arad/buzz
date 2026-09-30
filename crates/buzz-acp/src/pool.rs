@@ -155,13 +155,19 @@ pub struct SessionState {
     #[serde(default)]
     pub(crate) turn_active: bool,
     #[serde(default)]
+    pub(crate) pending_turn: Option<crate::turn_recovery::Pending>,
+    #[serde(default)]
+    pub(crate) recovered_reminders: Vec<(String, String)>,
+    #[serde(default)]
+    pub(crate) recovery_held: bool,
+    #[serde(default)]
     pub(crate) model_override: Option<String>,
 }
 
 impl SessionState {
     /// Invalidate the session (and turn counter) for a specific prompt source.
     pub fn invalidate(&mut self, source: &PromptSource) {
-        if self.store.is_some() && self.turn_active {
+        if self.store.is_some() && (self.turn_active || self.pending_turn.is_some()) {
             return;
         }
         match source {
@@ -180,7 +186,7 @@ impl SessionState {
     /// Invalidate a single session scope's session and turn counter.
     /// Returns `true` if the scope had an active session.
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
-        if self.store.is_some() && self.turn_active {
+        if self.store.is_some() && (self.turn_active || self.pending_turn.is_some()) {
             return false;
         }
         self.turn_counts.remove(scope);
@@ -392,7 +398,7 @@ pub struct PromptResult {
 /// (conversation or thread), not just the channel id, so completion and
 /// invalidation target the exact session. Use [`channel_id`](PromptSource::channel_id)
 /// where only the channel is needed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PromptSource {
     Channel(SessionScope),
     Heartbeat,
@@ -406,6 +412,8 @@ pub struct PrivatePrompt {
     pub text: String,
     /// Whether this is a heartbeat or a due reminder.
     pub source: PromptSource,
+    /// Exact reminder occurrence, retained until its native turn is acknowledged.
+    pub reminder: Option<(String, String)>,
 }
 
 impl PromptSource {
@@ -963,7 +971,11 @@ impl AgentPool {
         if let Some(scope) = scope {
             let idx = self.agents.iter().position(|slot| {
                 slot.as_ref()
-                    .map(|a| a.state.sessions.contains_key(scope))
+                    .map(|a| {
+                        a.state.sessions.contains_key(scope)
+                            && a.state.pending_turn.is_none()
+                            && a.state.store_error.is_none()
+                    })
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
@@ -972,7 +984,10 @@ impl AgentPool {
         }
 
         // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
+        let idx = self.agents.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|a| a.state.pending_turn.is_none() && a.state.store_error.is_none())
+        });
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
@@ -995,6 +1010,69 @@ impl AgentPool {
             );
         }
         self.agents[idx] = Some(agent);
+    }
+
+    pub(crate) fn dispatch_recoveries(&mut self, ctx: &Arc<PromptContext>) {
+        for index in 0..self.agents.len() {
+            let ready = self.agents[index].as_ref().is_some_and(|agent| {
+                agent.state.pending_turn.is_some()
+                    && !agent.state.recovery_held
+                    && agent.state.store_error.is_none()
+            });
+            if !ready {
+                continue;
+            }
+            let Some(agent) = self.agents[index].take() else {
+                continue;
+            };
+            let Some(pending) = agent.state.pending_turn.clone() else {
+                continue;
+            };
+            let handle = self.join_set.spawn(crate::turn_recovery::run(
+                agent,
+                Arc::clone(ctx),
+                self.result_tx.clone(),
+            ));
+            self.task_map.insert(
+                handle.id(),
+                TaskMeta {
+                    agent_index: index,
+                    channel_id: None,
+                    scope: None,
+                    turn_id: pending.attempt,
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+        }
+    }
+
+    pub(crate) fn flush_recovered_reminders(
+        &mut self,
+        reminders: &mut crate::reminders::Reminders,
+    ) {
+        for agent in self.agents.iter_mut().flatten() {
+            if agent.state.recovered_reminders.is_empty() {
+                continue;
+            }
+            let result = agent
+                .state
+                .recovered_reminders
+                .iter()
+                .try_for_each(|(id, event)| reminders.recovered(id, event));
+            match result {
+                Ok(()) => {
+                    agent.state.recovered_reminders.clear();
+                    agent.state.persist_invalidation();
+                }
+                Err(error) => {
+                    agent.state.store_error = Some(error.to_string());
+                    tracing::error!(%error, "recovered reminder receipt unavailable; holding agent");
+                }
+            }
+        }
     }
 
     /// Whether any agent is currently idle (sitting in its slot).
@@ -2151,11 +2229,30 @@ fn send_prompt_result(
     mut agent: OwnedAgent,
     source: PromptSource,
     mut outcome: PromptOutcome,
-    batch: Option<FlushBatch>,
+    mut batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    if agent.state.pending_turn.is_some() {
+        match &outcome {
+            PromptOutcome::Ok(StopReason::EndTurn) => {
+                if let Err(error) = agent.state.complete_recovery(true) {
+                    agent.state.store_error = Some(error.to_string());
+                    outcome = PromptOutcome::Error(AcpError::Protocol(error.to_string()));
+                }
+            }
+            PromptOutcome::Ok(StopReason::Cancelled) => {
+                if let Err(error) = agent.state.complete_recovery(false) {
+                    agent.state.store_error = Some(error.to_string());
+                    outcome = PromptOutcome::Error(AcpError::Protocol(error.to_string()));
+                }
+            }
+            _ => {
+                batch = None;
+            }
+        }
+    }
     if matches!(outcome, PromptOutcome::Ok(_) | PromptOutcome::Cancelled) {
-        agent.state.turn_active = false;
+        agent.state.turn_active = agent.state.pending_turn.is_some();
     }
     agent.state.model_override = agent
         .model_overridden
@@ -2217,6 +2314,9 @@ pub async fn run_prompt_task(
         );
         return;
     }
+    let recovery_reminder = private_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.reminder.clone());
     let prompt_text = private_prompt.map(|prompt| prompt.text);
     let observer_channel_id = source.channel_id();
     let turn_started_at = chrono::Utc::now().to_rfc3339();
@@ -2595,7 +2695,7 @@ pub async fn run_prompt_task(
             }
         }
     }
-    if agent.state.store.is_some() {
+    if agent.state.store.is_some() && !agent.acp.recovery_supported() {
         agent.state.turn_active = true;
         if let Err(error) = agent.state.checkpoint() {
             agent.state.store_error = Some(error.to_string());
@@ -2674,6 +2774,25 @@ pub async fn run_prompt_task(
                 &standing,
                 initial_msg,
             );
+            let pending = crate::turn_recovery::Pending {
+                attempt: format!("{turn_id}:initial"),
+                session: session_id.clone(),
+                source: source.clone(),
+                delivered: Vec::new(),
+                standing: !agent.has_system_prompt_support(),
+                reminder: None,
+            };
+            if let Err(error) = crate::turn_recovery::begin(&mut agent, pending) {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    None,
+                );
+                return;
+            }
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -2686,6 +2805,23 @@ pub async fn run_prompt_task(
 
             match init_result {
                 Ok(stop_reason) => {
+                    if agent.state.pending_turn.is_some() {
+                        if let Err(error) = agent
+                            .state
+                            .complete_recovery(matches!(stop_reason, StopReason::EndTurn))
+                        {
+                            agent.state.store_error = Some(error.to_string());
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(AcpError::Protocol(error.to_string())),
+                                None,
+                            );
+                            return;
+                        }
+                    }
                     tracing::info!(
                         target: "pool::session",
                         "initial_message complete for channel {cid}: {stop_reason:?}"
@@ -2993,6 +3129,25 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    let pending = crate::turn_recovery::Pending {
+        attempt: turn_id.clone(),
+        session: session_id.clone(),
+        source: source.clone(),
+        delivered: pending_delivered_event_ids.iter().cloned().collect(),
+        standing: !agent.has_system_prompt_support(),
+        reminder: recovery_reminder,
+    };
+    if let Err(error) = crate::turn_recovery::begin(&mut agent, pending) {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            None,
+        );
+        return;
+    }
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -5352,6 +5507,10 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 }
 
 #[cfg(test)]
+#[path = "turn_recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -6730,6 +6889,7 @@ done"#,
                 Some(PrivatePrompt {
                     text: "only the new follow-up".into(),
                     source: PromptSource::Heartbeat,
+                    reminder: None,
                 }),
                 Arc::new(ctx),
                 tx,
@@ -6825,6 +6985,7 @@ done"#
                 Some(PrivatePrompt {
                     text: format!("heartbeat-{turn}"),
                     source: PromptSource::Heartbeat,
+                    reminder: None,
                 }),
                 Arc::clone(&ctx),
                 result_tx.clone(),
