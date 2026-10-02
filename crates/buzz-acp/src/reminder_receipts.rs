@@ -11,6 +11,12 @@ pub(super) struct Receipts {
     _lock: File,
 }
 
+impl Drop for Receipts {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
+}
+
 impl Receipts {
     pub(super) fn open(base: &Path, relay: &str, author: &str) -> Result<Self> {
         let scope = hex::encode(Sha256::digest(format!("{relay}\n{author}")));
@@ -53,13 +59,24 @@ impl Receipts {
     }
 
     pub(super) fn record(&self, reminder: &Reminder) -> Result<()> {
+        self.record_parts(&reminder.id, &reminder.event_id)
+    }
+
+    pub(super) fn record_parts(&self, id: &str, event_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            event_id.len() == 64 && event_id.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid recovered reminder event"
+        );
         let temporary = self
             .directory
             .join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         let mut file = private_file(&temporary, true)?;
-        writeln!(file, "{}", reminder.event_id)?;
+        writeln!(file, "{event_id}")?;
         file.sync_all()?;
-        fs::rename(&temporary, self.path(reminder))?;
+        fs::rename(
+            &temporary,
+            self.directory.join(hex::encode(Sha256::digest(id))),
+        )?;
         #[cfg(unix)]
         File::open(&self.directory)?.sync_all()?;
         Ok(())
@@ -80,4 +97,20 @@ fn private_file(path: &Path, exclusive: bool) -> Result<File> {
         options.mode(0o600);
     }
     Ok(options.open(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retiring_receipt_owner_releases_a_lock_even_with_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Receipts::open(directory.path(), "relay", "owner").unwrap();
+        let inherited = first._lock.try_clone().unwrap();
+        assert!(Receipts::open(directory.path(), "relay", "owner").is_err());
+        drop(first);
+        let _next = Receipts::open(directory.path(), "relay", "owner").unwrap();
+        drop(inherited);
+    }
 }

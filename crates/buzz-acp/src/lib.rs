@@ -11,11 +11,14 @@ mod pool_lifecycle;
 mod prompt_framing;
 mod prompt_project;
 mod queue;
+mod recovery_wait;
 mod relay;
 mod reminder_receipts;
 mod reminders;
 mod scope;
+mod session_store;
 mod setup_mode;
+mod turn_recovery;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -3021,6 +3024,10 @@ async fn tokio_main() -> Result<()> {
         if let Some(state) = reminders.as_mut() {
             state.recover_missing_turn(pool.task_map().values().map(|meta| meta.turn_id.clone()));
         }
+        if let Some(state) = reminders.as_mut() {
+            pool.flush_recovered_reminders(state);
+        }
+        pool.dispatch_recoveries(&ctx);
         let next_reminder = match reminders.as_ref().map(|state| state.next()).transpose() {
             Ok(candidate) => candidate.flatten(),
             Err(error) => {
@@ -3114,14 +3121,35 @@ async fn tokio_main() -> Result<()> {
         while let Ok(rr) = respawn_rx.try_recv() {
             crash_history[rr.index].respawn_in_flight = false;
             match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
+                Ok((mut acp, protocol_version, agent_name)) => {
+                    let identity = format!(
+                        "{}:{}:{}",
+                        config.relay_url,
+                        config.keys.public_key().to_hex(),
+                        config.session_policy
+                    );
+                    let state = match SessionState::restore(rr.index, &identity) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            acp.shutdown().await;
+                            crash_history[rr.index].mark_spawn_failed();
+                            tracing::error!(
+                                agent = rr.index,
+                                "conversation restoration failed: {error}"
+                            );
+                            continue;
+                        }
+                    };
                     let agent = OwnedAgent {
                         index: rr.index,
                         acp,
-                        state: SessionState::default(),
                         model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
+                        desired_model: state
+                            .model_override
+                            .clone()
+                            .or_else(|| config.model.clone()),
+                        model_overridden: state.model_override.is_some(),
+                        state,
                         desired_model_request_id: None,
                         desired_model_pending_ack: false,
                         startup_effort: config.effort_level.clone(),
@@ -5246,7 +5274,10 @@ fn dispatch_private(
     if *heartbeat_in_flight {
         return None;
     }
-    let agent = pool.try_claim(None)?;
+    let agent = match reminder.as_ref() {
+        Some(reminder) => pool.try_claim_reminder(&reminder.event_id)?,
+        None => pool.try_claim(None)?,
+    };
 
     let prompt_text = ctx
         .heartbeat_prompt
@@ -5269,6 +5300,7 @@ fn dispatch_private(
             Some(pool::PrivatePrompt {
                 text: prompt_text,
                 source: PromptSource::Heartbeat,
+                reminder: None,
             }),
             ctx_clone,
             result_tx,
@@ -5476,6 +5508,7 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
 }
 
 struct PoolStartup {
+    session_identity: String,
     agents: u32,
     command: String,
     args: Vec<String>,
@@ -5489,6 +5522,12 @@ struct PoolStartup {
 impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
+            session_identity: format!(
+                "{}:{}:{}",
+                config.relay_url,
+                config.keys.public_key().to_hex(),
+                config.session_policy
+            ),
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),
@@ -5509,6 +5548,13 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
+        let state = match SessionState::restore(i, &startup.session_identity) {
+            Ok(state) => state,
+            Err(error) => {
+                shutdown_agent_slots(&mut agent_slots).await;
+                return Err(error);
+            }
+        };
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
@@ -5559,10 +5605,13 @@ async fn initialize_agent_pool(
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
-                            state: SessionState::default(),
                             model_capabilities: None,
-                            desired_model: startup.model.clone(),
-                            model_overridden: false,
+                            desired_model: state
+                                .model_override
+                                .clone()
+                                .or_else(|| startup.model.clone()),
+                            model_overridden: state.model_override.is_some(),
+                            state,
                             desired_model_request_id: None,
                             desired_model_pending_ack: false,
                             startup_effort: startup.effort_level.clone(),

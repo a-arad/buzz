@@ -257,8 +257,11 @@ impl EventQueue {
     /// Set the in-flight backstop deadline from the configured max turn
     /// duration, preserving the 100s buffer for cancel-drain grace + respawn.
     pub fn with_in_flight_deadline(mut self, max_turn_duration_secs: u64) -> Self {
-        self.in_flight_deadline =
-            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+        self.in_flight_deadline = if max_turn_duration_secs == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS)
+        };
         self
     }
 
@@ -271,6 +274,10 @@ impl EventQueue {
     /// a deadline.
     pub fn extend_in_flight_deadline<K: IntoScope>(&mut self, scope: K, max_turn_secs: u64) {
         let scope = scope.into_scope();
+        if max_turn_secs == 0 {
+            self.in_flight_deadlines.remove(&scope);
+            return;
+        }
         if let Some(current) = self.in_flight_deadlines.get_mut(&scope) {
             let extended = Instant::now()
                 + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
@@ -430,8 +437,10 @@ impl EventQueue {
                         let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
                         let cancel_reason = self.cancel_reasons.remove(&scope);
                         self.in_flight_scopes.insert(scope.clone());
-                        self.in_flight_deadlines
-                            .insert(scope.clone(), now + self.in_flight_deadline);
+                        if !self.in_flight_deadline.is_zero() {
+                            self.in_flight_deadlines
+                                .insert(scope.clone(), now + self.in_flight_deadline);
+                        }
                         self.in_flight_batch_sizes
                             .insert(scope.clone(), cancelled.len());
                         return Some(FlushBatch {
@@ -471,8 +480,10 @@ impl EventQueue {
         }
 
         self.in_flight_scopes.insert(scope.clone());
-        self.in_flight_deadlines
-            .insert(scope.clone(), now + self.in_flight_deadline);
+        if !self.in_flight_deadline.is_zero() {
+            self.in_flight_deadlines
+                .insert(scope.clone(), now + self.in_flight_deadline);
+        }
         self.in_flight_batch_sizes
             .insert(scope.clone(), events.len());
 
@@ -2224,6 +2235,21 @@ mod tests {
             received_at: Instant::now(),
             prompt_tag: "test".into(),
         }
+    }
+
+    #[test]
+    fn unlimited_turn_keeps_queue_ownership_until_completion() {
+        let mut queue = EventQueue::new(DedupMode::Queue).with_in_flight_deadline(0);
+        let channel = Uuid::new_v4();
+        queue.push(make_queued(channel, "first task"));
+        assert!(queue.flush_next().is_some());
+        queue.push(make_queued(channel, "follow-up"));
+        queue.extend_in_flight_deadline(channel, 0);
+        assert!(queue.in_flight_deadlines.is_empty());
+        assert!(queue.flush_next().is_none());
+        queue.mark_complete(channel);
+        let batch = queue.flush_next().unwrap();
+        assert_eq!(batch.events[0].event.content, "follow-up");
     }
 
     /// Build a QueuedEvent with a specific `received_at` offset from now.

@@ -67,7 +67,7 @@ impl std::fmt::Display for SessionPolicy {
 /// This is the canonical key for provider sessions, queue partitions, in-flight
 /// tracking, and context gathering. The channel remains the authorization and
 /// collaboration boundary; the scope is the default *execution* boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum SessionScope {
     /// The whole channel is one session. Used for DMs always, and for every
     /// channel event under [`SessionPolicy::Channel`].

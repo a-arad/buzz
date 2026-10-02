@@ -33,10 +33,29 @@ author's encrypted NIP-ER state; no channel message is published automatically.
 
 On relays advertising NIP-ER and NIP-42, the harness queries the author's current
 reminder heads every 30 seconds, with paginated recovery and no creation-time
-lower bound. Due work uses the existing private session and agent pool after
-queued messages, without interrupting active work. It rechecks the head before
+lower bound. Due work uses a fresh private conversation for each exact reminder
+event, after queued messages and without interrupting active work. Retries use
+the same conversation and worker, including after a restart with the durable
+session store. A later snooze has a new event and therefore a new conversation.
+The harness rechecks the head before
 dispatch, so snoozes and cancellations supersede waiting intent. The reminder
 note and target provide context when the originating session no longer exists.
+
+Adapters that create workspaces can advertise `_meta.axesWorkspaceReuse.version = 1`
+in their initialize result. The harness then supplies
+`_meta.axesWorkspaceReuse.sessionId` on fresh reminder `session/new` requests,
+pointing to the worker's existing private workspace owner. This reuses working
+files without copying native conversation history; the adapter must reject
+concurrent writers and verify the owner's retained workspace when loading.
+`contracts/axes-workspace-reuse.json` is shared with the Edamame research adapter.
+Upgrade that adapter before this harness. Standard adapters continue to receive
+their commissioned `cwd`; ordinary channel/thread and heartbeat session policies
+are unchanged. Model and reasoning settings still follow normal session creation.
+
+For a fork release PR targeting a maintained branch other than upstream `main`,
+set `CHECK_BRANCH_SKEW_REMOTE` and `CHECK_BRANCH_SKEW_BRANCH` to its actual remote
+and target when pushing. The overlap guard fetches and checks that target; it
+fails if the explicitly selected target is unavailable.
 
 A normally completed turn gets a durable delivery receipt; the agent separately
 chooses whether to complete, snooze, or cancel the reminder. Pending reminders
@@ -143,8 +162,8 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
-| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
-| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. `0` disables this deadline. |
+| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn. `0` disables this deadline. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
@@ -383,3 +402,31 @@ See the [root TESTING.md](../../TESTING.md) for the full integration testing gui
 ## License
 
 Apache-2.0
+
+For research workers whose lifetime is owned by the operator's service manager,
+set `BUZZ_ACP_MAX_TURN_DURATION=0` and `BUZZ_ACP_IDLE_TIMEOUT=0` to let a turn run
+until completion or explicit cancellation. Zero disables that deadline; positive
+values retain the existing timeout behavior. An unlimited turn retains its queue
+ownership until completion, cancellation, or a reported process failure.
+
+### Restart-safe conversations
+
+`BUZZ_ACP_SESSION_STORE=/private/role/sessions` opts a supervised harness into
+private, atomic conversation checkpoints. Commission a separate directory for
+each identity. The checkpoint binds the relay, public identity, session policy,
+and pool slot; another process cannot own the same slot concurrently. The adapter
+must support ACP `session/load` and retain its own native-session references.
+
+An idle restart restores channel/thread and heartbeat sessions, delivered-event
+IDs, standing instructions, turn counters, and model override. Loading never
+submits a prompt. A missing native history or failed load is an error, with no
+new-session fallback. An interrupted turn or unreadable checkpoint requires
+operator reconciliation; the harness does not infer completion or replay work.
+Explicit idle resets retain their usual meaning. Automatic rotation during an
+uncertain turn is suppressed to retain the original conversation evidence.
+
+For an already running legacy harness, enabling this option alone cannot recover
+its in-memory mappings. Reconstruct and verify the exact identity/scope/session
+references and delivery state from retained local evidence before the first idle
+restart. If any reference is ambiguous, leave that service running until resolved.
+Keep reminder receipts, native histories, workspaces, and provider settings intact.

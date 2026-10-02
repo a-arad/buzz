@@ -200,6 +200,11 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    recovery_supported: bool,
+    workspace_reuse_supported: bool,
+    workspace_reuse_session: Option<String>,
+    recovery_attempt: Option<String>,
+    current_recovery_attempt: Option<String>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -559,6 +564,11 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            recovery_supported: false,
+            workspace_reuse_supported: false,
+            workspace_reuse_session: None,
+            recovery_attempt: None,
+            current_recovery_attempt: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -617,6 +627,14 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.recovery_supported = result
+            .pointer("/_meta/axesRecovery/version")
+            .and_then(|v| v.as_u64())
+            == Some(1);
+        self.workspace_reuse_supported = result
+            .pointer("/_meta/axesWorkspaceReuse/version")
+            .and_then(|v| v.as_u64())
+            == Some(1);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -627,6 +645,11 @@ impl AcpClient {
             "methodId": method_id,
         });
         self.send_request("authenticate", params).await
+    }
+
+    /// Reuse a commissioned workspace for the next fresh session when supported.
+    pub(crate) fn reuse_workspace(&mut self, session: Option<String>) {
+        self.workspace_reuse_session = self.workspace_reuse_supported.then_some(session).flatten();
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -673,6 +696,9 @@ impl AcpClient {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
+        if let Some(session) = self.workspace_reuse_session.take() {
+            params["_meta"]["axesWorkspaceReuse"] = serde_json::json!({"sessionId": session});
+        }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
             .as_str()
@@ -683,6 +709,22 @@ impl AcpClient {
             session_id,
             raw: result,
         })
+    }
+
+    /// Restore an existing ACP session without submitting or replaying a prompt.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+    ) -> Result<serde_json::Value, AcpError> {
+        self.send_request(
+            "session/load",
+            serde_json::json!({
+                "sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers,
+            }),
+        )
+        .await
     }
 
     /// Send `session/new` and return only the `sessionId` string.
@@ -781,9 +823,66 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let params = build_prompt_params(session_id, prompt_blocks);
+        let mut params = build_prompt_params(session_id, prompt_blocks);
+        if let Some(attempt) = self.recovery_attempt.take() {
+            params["_meta"] = serde_json::json!({"axesRecovery": {"attempt": attempt}});
+        }
+        self.prompt_request(
+            "session/prompt",
+            session_id,
+            params,
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    /// Whether the adapter persists correlated native turn outcomes.
+    pub fn recovery_supported(&self) -> bool {
+        self.recovery_supported
+    }
+
+    /// Bind the next prompt to its durable harness checkpoint.
+    pub fn set_recovery_attempt(&mut self, attempt: String) {
+        self.recovery_attempt = Some(attempt);
+    }
+
+    /// Resolve an accepted attempt using native evidence, without replaying its prompt.
+    pub async fn recover_turn(
+        &mut self,
+        session_id: &str,
+        attempt: &str,
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
+        if !self.recovery_supported {
+            return Err(AcpError::Protocol("adapter lacks durable recovery".into()));
+        }
+        self.prompt_request(
+            "_axes/recover",
+            session_id,
+            serde_json::json!({"sessionId": session_id, "attempt": attempt}),
+            idle_timeout,
+            max_duration,
+        )
+        .await
+    }
+
+    async fn prompt_request(
+        &mut self,
+        method: &str,
+        session_id: &str,
+        params: serde_json::Value,
+        idle_timeout: std::time::Duration,
+        max_duration: std::time::Duration,
+    ) -> Result<StopReason, AcpError> {
+        self.current_recovery_attempt = params
+            .pointer("/_meta/axesRecovery/attempt")
+            .or_else(|| params.get("attempt"))
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let hard_deadline = tokio::time::Instant::now() + max_duration;
-        self.current_hard_deadline = Some(hard_deadline);
+        self.current_hard_deadline = (!max_duration.is_zero()).then_some(hard_deadline);
 
         // Mark the usage tracker as in-flight for this turn BEFORE sending the
         // prompt so that any setup notifications recorded earlier are not
@@ -798,7 +897,7 @@ impl AcpClient {
         let msg = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": "session/prompt",
+            "method": method,
             "params": params,
         });
 
@@ -1049,6 +1148,9 @@ impl AcpClient {
         let remaining = hard_deadline
             .checked_duration_since(tokio::time::Instant::now())
             .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(AcpError::HardTimeout { silence: remaining });
+        }
         let result = self
             .read_until_response_with_idle_timeout(
                 session_id,
@@ -1345,15 +1447,19 @@ impl AcpClient {
         let mut idle_deadline = now + idle_timeout;
         let mut hard_deadline = hard_deadline;
         let mut last_activity_at = now;
+        let mut admission_wait = crate::recovery_wait::Wait::default();
 
         loop {
             // Determine which deadline fires first BEFORE sleeping — this is
             // the classification we'll use on timeout, immune to scheduler jitter.
-            let idle_fires_first = idle_deadline < hard_deadline;
+            let idle_fires_first = !idle_timeout.is_zero()
+                && (max_duration.is_zero() || idle_deadline < hard_deadline);
             let next_deadline = if idle_fires_first {
-                idle_deadline
+                Some(idle_deadline)
+            } else if !max_duration.is_zero() {
+                Some(hard_deadline)
             } else {
-                hard_deadline
+                None
             };
 
             // Pre-select deadline check — required by Max's review. Under
@@ -1363,7 +1469,7 @@ impl AcpClient {
             // producing output (see `acp.rs:608` for why the hard deadline
             // exists). Check the classified deadline here so a steady-
             // stream agent is still bounded.
-            if Instant::now() >= next_deadline {
+            if next_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                 if let Some((_, _, ack_tx)) = pending_steer.take() {
                     // Prompt is timing out — release the withheld event via
                     // PromptCompletedNeutral (no fallback signal: there is
@@ -1484,7 +1590,7 @@ impl AcpClient {
                     // response or the steer response next.
                     None
                 }
-                _ = tokio::time::sleep_until(next_deadline) => {
+                _ = tokio::time::sleep_until(next_deadline.unwrap_or(now)), if next_deadline.is_some() => {
                     // The pre-select check at the top of the next iteration
                     // would catch this anyway, but firing the deadline arm
                     // here makes the wakeup immediate (no extra reader poll
@@ -1562,6 +1668,35 @@ impl AcpClient {
                     let activity_now = Instant::now();
                     idle_deadline = activity_now + idle_timeout;
                     last_activity_at = activity_now;
+                    if self.recovery_supported && self.current_recovery_attempt.is_some() {
+                        if msg.get("method").and_then(|v| v.as_str())
+                            == Some("_axes/recovery/status")
+                        {
+                            let params = &msg["params"];
+                            if params["sessionId"].as_str() == Some(session_id)
+                                && params["attempt"].as_str()
+                                    == self.current_recovery_attempt.as_deref()
+                            {
+                                if let Some(waiting) = params["waiting"].as_bool() {
+                                    admission_wait.update(
+                                        waiting,
+                                        activity_now,
+                                        &mut hard_deadline,
+                                    );
+                                    self.current_hard_deadline =
+                                        (!max_duration.is_zero()).then_some(hard_deadline);
+                                }
+                            }
+                            continue;
+                        }
+                        if msg["method"] == "session/update"
+                            || msg.get("id") == Some(&serde_json::json!(expected_id))
+                        {
+                            admission_wait.update(false, activity_now, &mut hard_deadline);
+                            self.current_hard_deadline =
+                                (!max_duration.is_zero()).then_some(hard_deadline);
+                        }
+                    }
 
                     // Steer response routing must come BEFORE the prompt
                     // response check: a steer response is a regular
@@ -1634,7 +1769,9 @@ impl AcpClient {
                                             Some(_) => {
                                                 let renew_now = Instant::now();
                                                 let new_deadline = renew_now + max_duration;
-                                                if new_deadline > hard_deadline {
+                                                if !max_duration.is_zero()
+                                                    && new_deadline > hard_deadline
+                                                {
                                                     hard_deadline = new_deadline;
                                                     self.current_hard_deadline = Some(new_deadline);
                                                     tracing::info!(
@@ -3123,6 +3260,71 @@ mod tests {
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
         );
+    }
+
+    #[tokio::test]
+    async fn verified_admission_wait_pauses_budget_but_wrong_attempt_does_not() {
+        for attempt in ["original", "different"] {
+            let script = format!(
+                r#"echo '{{"jsonrpc":"2.0","method":"_axes/recovery/status","params":{{"sessionId":"native","attempt":"{attempt}","waiting":true}}}}'; sleep 0.4; echo '{{"jsonrpc":"2.0","method":"_axes/recovery/status","params":{{"sessionId":"native","attempt":"{attempt}","waiting":false}}}}'; echo '{{"jsonrpc":"2.0","id":42,"result":{{"stopReason":"end_turn"}}}}'; sleep 0.2"#
+            );
+            let mut client = spawn_script(&script).await;
+            client.recovery_supported = true;
+            client.current_recovery_attempt = Some("original".into());
+            let budget = std::time::Duration::from_millis(200);
+            let result = client
+                .read_until_response_with_idle_timeout(
+                    "native",
+                    42,
+                    std::time::Duration::from_secs(5),
+                    tokio::time::Instant::now() + budget,
+                    budget,
+                )
+                .await;
+            if attempt == "original" {
+                assert_eq!(result.unwrap()["stopReason"], "end_turn");
+            } else {
+                assert!(matches!(result, Err(AcpError::HardTimeout { .. })));
+            }
+            client.shutdown().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unlimited_turn_completes_after_elapsed_deadlines() {
+        let mut client =
+            spawn_script(r#"echo '{"jsonrpc":"2.0","id":42,"result":{"stopReason":"end_turn"}}'"#)
+                .await;
+        let start = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_secs(3 * 3600)).await;
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "test",
+                42,
+                std::time::Duration::ZERO,
+                start,
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn unlimited_session_prompt_round_trips_without_cancellation() {
+        let mut client = spawn_script(
+            r#"read -r request; echo '{"jsonrpc":"2.0","id":0,"result":{"stopReason":"end_turn"}}'"#,
+        ).await;
+        let result = client
+            .session_prompt_with_idle_timeout(
+                "test",
+                "finish the work",
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            )
+            .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(client.current_hard_deadline.is_none());
     }
 
     #[tokio::test]
