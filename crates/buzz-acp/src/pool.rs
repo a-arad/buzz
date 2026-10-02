@@ -112,6 +112,13 @@ pub struct ChannelDeliveryState {
     pub delivered_event_ids: HashSet<String>,
 }
 
+/// The native conversation retained for one exact reminder occurrence.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReminderSession {
+    pub session: String,
+    pub standing_context_sent: bool,
+}
+
 /// Per-channel session IDs, turn counters, and delivery state.
 ///
 /// Separated from `OwnedAgent` so the state machine is testable without
@@ -122,6 +129,10 @@ pub struct SessionState {
     #[serde(with = "crate::session_store::scope_map")]
     pub sessions: HashMap<SessionScope, String>,
     pub heartbeat_session: Option<String>,
+    #[serde(default)]
+    pub(crate) reminder_sessions: HashMap<String, ReminderSession>,
+    #[serde(default)]
+    pub(crate) reminder_workspace_session: Option<String>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
     #[serde(with = "crate::session_store::scope_map")]
@@ -174,12 +185,13 @@ impl SessionState {
             PromptSource::Channel(scope) => {
                 self.invalidate_scope(scope);
             }
-            PromptSource::Heartbeat | PromptSource::Reminder => {
+            PromptSource::Heartbeat => {
                 self.heartbeat_session = None;
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
                 self.persist_invalidation();
             }
+            PromptSource::Reminder => {}
         }
     }
 
@@ -229,11 +241,15 @@ impl SessionState {
             self.pending_loads = self.sessions.values().cloned().collect();
             self.pending_loads
                 .extend(self.heartbeat_session.iter().cloned());
+            self.pending_loads
+                .extend(self.reminder_sessions.values().map(|s| s.session.clone()));
             return;
         }
         self.sessions.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
+        self.reminder_sessions.clear();
+        self.reminder_workspace_session = None;
         self.heartbeat_turn_count = 0;
         self.heartbeat_standing_context_sent = false;
         self.core_sections.clear();
@@ -373,6 +389,7 @@ pub struct AgentPool {
     /// Best-effort: stale entries (rotation, crash/respawn) self-heal on the
     /// next dispatch and are pruned on channel-wide session invalidation.
     session_owners: HashMap<SessionScope, usize>,
+    reminder_owners: HashMap<String, usize>,
     /// First time each scope was held for a busy owner, so the bounded hold can
     /// expire and fork rather than starve behind an unbounded turn. Derived
     /// state: cleared on every dispatch/invalidation path, and only ever holds
@@ -883,6 +900,18 @@ impl AgentPool {
                     .map(|scope| (scope, agent.index))
             })
             .collect();
+        let reminder_owners = slots
+            .iter()
+            .flatten()
+            .flat_map(|agent| {
+                agent
+                    .state
+                    .reminder_sessions
+                    .keys()
+                    .cloned()
+                    .map(|event| (event, agent.index))
+            })
+            .collect();
         Self {
             agents: slots,
             result_tx,
@@ -890,6 +919,7 @@ impl AgentPool {
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             session_owners,
+            reminder_owners,
             held_since: HashMap::new(),
         }
     }
@@ -967,6 +997,7 @@ impl AgentPool {
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
+        self.restore_reminder_owners();
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
             let idx = self.agents.iter().position(|slot| {
@@ -991,6 +1022,38 @@ impl AgentPool {
         idx.map(|i| self.agents[i].take().unwrap())
     }
 
+    /// Keep retries on their original worker, including while that worker is busy.
+    pub(crate) fn try_claim_reminder(&mut self, event: &str) -> Option<OwnedAgent> {
+        self.restore_reminder_owners();
+        if let Some(&index) = self.reminder_owners.get(event) {
+            let slot = self.agents.get_mut(index)?;
+            let agent = slot.as_ref()?;
+            if agent.state.pending_turn.is_some() || agent.state.store_error.is_some() {
+                return None;
+            }
+            return slot.take();
+        }
+        if (0..self.agents.len()).any(|index| !self.slot_alive(index)) {
+            return None;
+        }
+        let agent = self.try_claim(None)?;
+        self.reminder_owners.insert(event.to_owned(), agent.index);
+        Some(agent)
+    }
+
+    fn restore_reminder_owners(&mut self) {
+        for agent in self.agents.iter().flatten() {
+            self.reminder_owners.extend(
+                agent
+                    .state
+                    .reminder_sessions
+                    .keys()
+                    .cloned()
+                    .map(|event| (event, agent.index)),
+            );
+        }
+    }
+
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, mut agent: OwnedAgent) {
         agent.state.model_override = agent
@@ -999,6 +1062,14 @@ impl AgentPool {
             .flatten();
         agent.state.persist_invalidation();
         let idx = agent.index;
+        self.reminder_owners.extend(
+            agent
+                .state
+                .reminder_sessions
+                .keys()
+                .cloned()
+                .map(|event| (event, idx)),
+        );
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -1013,6 +1084,7 @@ impl AgentPool {
     }
 
     pub(crate) fn dispatch_recoveries(&mut self, ctx: &Arc<PromptContext>) {
+        self.restore_reminder_owners();
         for index in 0..self.agents.len() {
             let ready = self.agents[index].as_ref().is_some_and(|agent| {
                 agent.state.pending_turn.is_some()
@@ -2617,7 +2689,83 @@ pub async fn run_prompt_task(
                 }
             }
         }
-        PromptSource::Heartbeat | PromptSource::Reminder => {
+        PromptSource::Reminder => {
+            let Some((_, event)) = recovery_reminder.as_ref() else {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(AcpError::Protocol(
+                        "reminder occurrence is missing".into(),
+                    )),
+                    None,
+                );
+                return;
+            };
+            if let Some(saved) = agent.state.reminder_sessions.get(event) {
+                (saved.session.clone(), false)
+            } else {
+                let workspace = agent
+                    .state
+                    .reminder_workspace_session
+                    .clone()
+                    .or_else(|| agent.state.heartbeat_session.clone());
+                agent.acp.reuse_workspace(workspace.clone());
+                match create_session_and_apply_model(
+                    &mut agent,
+                    &ctx,
+                    None,
+                    NewSessionChannelContext {
+                        huddle_instructions: None,
+                        canvas: None,
+                        name: None,
+                        scope: None,
+                        channel_type: None,
+                    },
+                )
+                .await
+                {
+                    Ok(sid) => {
+                        agent.state.reminder_workspace_session =
+                            Some(workspace.unwrap_or_else(|| sid.clone()));
+                        agent.state.reminder_sessions.insert(
+                            event.clone(),
+                            ReminderSession {
+                                session: sid.clone(),
+                                standing_context_sent: false,
+                            },
+                        );
+                        agent.acp.notify_session_spawned(&sid);
+                        (sid, true)
+                    }
+                    Err(AcpError::AgentExited) => {
+                        agent.state.invalidate_all();
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::AgentExited,
+                            None,
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(error),
+                            None,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        PromptSource::Heartbeat => {
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
@@ -2751,9 +2899,11 @@ pub async fn run_prompt_task(
             .deliveries
             .get(scope)
             .is_some_and(|delivery| delivery.standing_context_sent),
-        PromptSource::Heartbeat | PromptSource::Reminder => {
-            agent.state.heartbeat_standing_context_sent
-        }
+        PromptSource::Reminder => recovery_reminder
+            .as_ref()
+            .and_then(|(_, event)| agent.state.reminder_sessions.get(event))
+            .is_some_and(|saved| saved.standing_context_sent),
+        PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
     };
 
     if is_new_session {
@@ -3135,7 +3285,7 @@ pub async fn run_prompt_task(
         source: source.clone(),
         delivered: pending_delivered_event_ids.iter().cloned().collect(),
         standing: !agent.has_system_prompt_support(),
-        reminder: recovery_reminder,
+        reminder: recovery_reminder.clone(),
     };
     if let Err(error) = crate::turn_recovery::begin(&mut agent, pending) {
         send_prompt_result(
@@ -3342,6 +3492,13 @@ pub async fn run_prompt_task(
                     standing_sent,
                     &pending_delivered_event_ids,
                 );
+            } else if matches!(source, PromptSource::Reminder) {
+                if let Some(saved) = recovery_reminder
+                    .as_ref()
+                    .and_then(|(_, event)| agent.state.reminder_sessions.get_mut(event))
+                {
+                    saved.standing_context_sent = true;
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -3360,7 +3517,8 @@ pub async fn run_prompt_task(
                             *count += 1;
                             *count >= limit
                         }
-                        PromptSource::Heartbeat | PromptSource::Reminder => {
+                        PromptSource::Reminder => false,
+                        PromptSource::Heartbeat => {
                             agent.state.heartbeat_turn_count += 1;
                             agent.state.heartbeat_turn_count >= limit
                         }
@@ -6834,6 +6992,172 @@ mod tests {
             pubkey: "author".into(),
             timestamp: "2026-08-09T00:00:00Z".into(),
             content: content.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reminders_start_fresh_reuse_workspace_and_restore_the_same_occurrence() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contracts/axes-workspace-reuse.json"))
+                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let capture = directory.path().join("wire.jsonl");
+        let script = r#"import json,sys
+count=0
+for line in sys.stdin:
+    with open(sys.argv[1], 'a') as f:f.write(line)
+    r=json.loads(line)
+    method=r['method']
+    if method=='initialize':
+        result={'protocolVersion':1,'agentCapabilities':{},'_meta':{'axesWorkspaceReuse':{'version':1}}}
+    elif method=='session/new':
+        count+=1
+        result={'sessionId':'reminder-'+str(count)}
+    else:result={'stopReason':'end_turn'}
+    if 'id' in r:print(json.dumps({'id':r['id'],'result':result}),flush=True)
+"#;
+        let mut acp = AcpClient::spawn(
+            "python3",
+            &[
+                "-u".into(),
+                "-c".into(),
+                script.into(),
+                capture.display().to_string(),
+            ],
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        let initialized = acp.initialize().await.unwrap();
+        assert_eq!(initialized["_meta"], contract["capability"]);
+        let store = directory.path().join("state");
+        let mut state = SessionState::open(&store, 0, "identity").unwrap();
+        state.heartbeat_session = Some("existing-workspace-owner".into());
+        state.heartbeat_standing_context_sent = true;
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "axes-native-research".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        let mut context = make_prompt_context_no_owner();
+        context.base_prompt = Some("normal native capabilities".into());
+        context.max_turns_per_session = 1;
+        let context = Arc::new(context);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for (number, event) in ["first", "first", "snoozed", "first"].iter().enumerate() {
+            if number == 3 {
+                agent.state.checkpoint().unwrap();
+                drop(agent.state);
+                agent.state = SessionState::open(&store, 0, "identity").unwrap();
+            }
+            run_prompt_task(
+                agent,
+                None,
+                Some(PrivatePrompt {
+                    text: format!("Reminder {event}: inspect its original thread"),
+                    source: PromptSource::Reminder,
+                    reminder: Some(("same-reminder-id".into(), event.to_string())),
+                }),
+                Arc::clone(&context),
+                tx.clone(),
+                None,
+                format!("turn-{number}"),
+            )
+            .await;
+            let result = rx.recv().await.unwrap();
+            assert!(matches!(
+                result.outcome,
+                PromptOutcome::Ok(StopReason::EndTurn)
+            ));
+            agent = result.agent;
+        }
+        let wire: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let creations: Vec<_> = wire
+            .iter()
+            .filter(|r| r["method"] == "session/new")
+            .collect();
+        assert_eq!(creations.len(), 2);
+        for request in creations {
+            let mut expected = contract["metadata"].clone();
+            expected["axesWorkspaceReuse"]["sessionId"] = "existing-workspace-owner".into();
+            assert_eq!(request["params"]["_meta"], expected);
+        }
+        let prompts: Vec<_> = wire
+            .iter()
+            .filter(|r| r["method"] == "session/prompt")
+            .collect();
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|r| r["params"]["sessionId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reminder-1", "reminder-1", "reminder-2", "reminder-1"]
+        );
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert_eq!(
+                prompt["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("normal native capabilities"),
+                index == 0 || index == 2
+            );
+        }
+        assert_eq!(
+            wire.iter()
+                .filter(|r| r["method"] == "session/load")
+                .count(),
+            1
+        );
+        assert_eq!(
+            agent.state.heartbeat_session.as_deref(),
+            Some("existing-workspace-owner")
+        );
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reminder_retry_waits_for_its_busy_or_held_owner() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let mut first = idle_agent_with_session(scope.clone()).await;
+        let mut second = idle_agent_with_session(scope).await;
+        first.index = 0;
+        second.index = 1;
+        second.state.reminder_sessions.insert(
+            "occurrence".into(),
+            ReminderSession {
+                session: "retained-native".into(),
+                standing_context_sent: true,
+            },
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        let mut owner = pool.try_claim_reminder("occurrence").unwrap();
+        assert_eq!(owner.index, 1);
+        assert!(pool.try_claim_reminder("occurrence").is_none());
+        owner.state.store_error = Some("retained work needs inspection".into());
+        pool.return_agent(owner);
+        assert!(pool.try_claim_reminder("occurrence").is_none());
+        pool.agents[1].as_mut().unwrap().state.store_error = None;
+        let owner = pool.try_claim_reminder("occurrence").unwrap();
+        assert_eq!(owner.index, 1);
+        pool.return_agent(owner);
+        for agent in pool.agents.iter_mut().flatten() {
+            agent.acp.shutdown().await;
         }
     }
 
