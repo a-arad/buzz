@@ -24,7 +24,20 @@ impl SessionState {
                     PromptSource::Channel(scope) => {
                         self.mark_scope_delivery_success(scope, pending.standing, pending.delivered)
                     }
-                    _ => self.heartbeat_standing_context_sent |= pending.standing,
+                    PromptSource::Reminder => {
+                        if let Some(saved) = pending
+                            .reminder
+                            .as_ref()
+                            .and_then(|(_, event)| self.reminder_sessions.get_mut(event))
+                        {
+                            saved.standing_context_sent |= pending.standing;
+                        } else {
+                            self.heartbeat_standing_context_sent |= pending.standing;
+                        }
+                    }
+                    PromptSource::Heartbeat => {
+                        self.heartbeat_standing_context_sent |= pending.standing
+                    }
                 }
                 if let Some(reminder) = pending.reminder {
                     self.recovered_reminders.push(reminder);

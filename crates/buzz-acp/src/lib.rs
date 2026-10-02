@@ -5274,7 +5274,10 @@ fn dispatch_private(
     if *heartbeat_in_flight {
         return None;
     }
-    let agent = pool.try_claim(None)?;
+    let agent = match reminder.as_ref() {
+        Some(reminder) => pool.try_claim_reminder(&reminder.event_id)?,
+        None => pool.try_claim(None)?,
+    };
 
     let prompt_text = ctx
         .heartbeat_prompt

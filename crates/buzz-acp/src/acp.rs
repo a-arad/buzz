@@ -201,6 +201,8 @@ pub struct AcpClient {
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
     recovery_supported: bool,
+    workspace_reuse_supported: bool,
+    workspace_reuse_session: Option<String>,
     recovery_attempt: Option<String>,
     current_recovery_attempt: Option<String>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
@@ -563,6 +565,8 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             recovery_supported: false,
+            workspace_reuse_supported: false,
+            workspace_reuse_session: None,
             recovery_attempt: None,
             current_recovery_attempt: None,
             steer_rx: None,
@@ -627,6 +631,10 @@ impl AcpClient {
             .pointer("/_meta/axesRecovery/version")
             .and_then(|v| v.as_u64())
             == Some(1);
+        self.workspace_reuse_supported = result
+            .pointer("/_meta/axesWorkspaceReuse/version")
+            .and_then(|v| v.as_u64())
+            == Some(1);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -637,6 +645,11 @@ impl AcpClient {
             "methodId": method_id,
         });
         self.send_request("authenticate", params).await
+    }
+
+    /// Reuse a commissioned workspace for the next fresh session when supported.
+    pub(crate) fn reuse_workspace(&mut self, session: Option<String>) {
+        self.workspace_reuse_session = self.workspace_reuse_supported.then_some(session).flatten();
     }
 
     /// Send `session/new` and return the full response alongside the session ID.
@@ -682,6 +695,9 @@ impl AcpClient {
         if let Some(title) = session_title {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if let Some(session) = self.workspace_reuse_session.take() {
+            params["_meta"]["axesWorkspaceReuse"] = serde_json::json!({"sessionId": session});
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]

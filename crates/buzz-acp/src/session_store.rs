@@ -93,6 +93,9 @@ impl SessionState {
         state
             .pending_loads
             .extend(state.heartbeat_session.iter().cloned());
+        state
+            .pending_loads
+            .extend(state.reminder_sessions.values().map(|s| s.session.clone()));
         state.store = Some(Arc::new(Store {
             path,
             identity: identity.into(),

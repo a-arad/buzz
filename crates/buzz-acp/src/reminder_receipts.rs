@@ -11,6 +11,12 @@ pub(super) struct Receipts {
     _lock: File,
 }
 
+impl Drop for Receipts {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self._lock);
+    }
+}
+
 impl Receipts {
     pub(super) fn open(base: &Path, relay: &str, author: &str) -> Result<Self> {
         let scope = hex::encode(Sha256::digest(format!("{relay}\n{author}")));
@@ -91,4 +97,20 @@ fn private_file(path: &Path, exclusive: bool) -> Result<File> {
         options.mode(0o600);
     }
     Ok(options.open(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retiring_receipt_owner_releases_a_lock_even_with_an_inherited_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = Receipts::open(directory.path(), "relay", "owner").unwrap();
+        let inherited = first._lock.try_clone().unwrap();
+        assert!(Receipts::open(directory.path(), "relay", "owner").is_err());
+        drop(first);
+        let _next = Receipts::open(directory.path(), "relay", "owner").unwrap();
+        drop(inherited);
+    }
 }

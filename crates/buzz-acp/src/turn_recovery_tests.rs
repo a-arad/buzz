@@ -61,6 +61,13 @@ async fn lost_ack_recovers_on_quiet_restart_without_new_prompt_or_reminder_deliv
         let ctx = Arc::new(tests::make_prompt_context_no_owner());
         let (tx, mut rx) = mpsc::unbounded_channel();
         let reminder = ("reminder-id".into(), "a".repeat(64));
+        worker.state.reminder_sessions.insert(
+            reminder.1.clone(),
+            ReminderSession {
+                session: "retained-session".into(),
+                standing_context_sent: false,
+            },
+        );
         run_prompt_task(
             worker,
             None,
@@ -101,6 +108,8 @@ async fn lost_ack_recovers_on_quiet_restart_without_new_prompt_or_reminder_deliv
         } else {
             assert!(result.agent.state.pending_turn.is_none());
             assert!(!result.agent.state.turn_active);
+            assert!(result.agent.state.reminder_sessions[&reminder.1].standing_context_sent);
+            assert!(!result.agent.state.heartbeat_standing_context_sent);
             assert_eq!(result.agent.state.recovered_reminders, vec![reminder]);
         }
         result.agent.acp.shutdown().await;

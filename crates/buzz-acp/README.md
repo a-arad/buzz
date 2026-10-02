@@ -33,10 +33,29 @@ author's encrypted NIP-ER state; no channel message is published automatically.
 
 On relays advertising NIP-ER and NIP-42, the harness queries the author's current
 reminder heads every 30 seconds, with paginated recovery and no creation-time
-lower bound. Due work uses the existing private session and agent pool after
-queued messages, without interrupting active work. It rechecks the head before
+lower bound. Due work uses a fresh private conversation for each exact reminder
+event, after queued messages and without interrupting active work. Retries use
+the same conversation and worker, including after a restart with the durable
+session store. A later snooze has a new event and therefore a new conversation.
+The harness rechecks the head before
 dispatch, so snoozes and cancellations supersede waiting intent. The reminder
 note and target provide context when the originating session no longer exists.
+
+Adapters that create workspaces can advertise `_meta.axesWorkspaceReuse.version = 1`
+in their initialize result. The harness then supplies
+`_meta.axesWorkspaceReuse.sessionId` on fresh reminder `session/new` requests,
+pointing to the worker's existing private workspace owner. This reuses working
+files without copying native conversation history; the adapter must reject
+concurrent writers and verify the owner's retained workspace when loading.
+`contracts/axes-workspace-reuse.json` is shared with the Edamame research adapter.
+Upgrade that adapter before this harness. Standard adapters continue to receive
+their commissioned `cwd`; ordinary channel/thread and heartbeat session policies
+are unchanged. Model and reasoning settings still follow normal session creation.
+
+For a fork release PR targeting a maintained branch other than upstream `main`,
+set `CHECK_BRANCH_SKEW_REMOTE` and `CHECK_BRANCH_SKEW_BRANCH` to its actual remote
+and target when pushing. The overlap guard fetches and checks that target; it
+fails if the explicitly selected target is unavailable.
 
 A normally completed turn gets a durable delivery receipt; the agent separately
 chooses whether to complete, snooze, or cancel the reminder. Pending reminders
