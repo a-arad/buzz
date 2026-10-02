@@ -52,6 +52,11 @@ Upgrade that adapter before this harness. Standard adapters continue to receive
 their commissioned `cwd`; ordinary channel/thread and heartbeat session policies
 are unchanged. Model and reasoning settings still follow normal session creation.
 
+For a fork release PR targeting a maintained branch other than upstream `main`,
+set `CHECK_BRANCH_SKEW_REMOTE` and `CHECK_BRANCH_SKEW_BRANCH` to its actual remote
+and target when pushing. The overlap guard fetches and checks that target; it
+fails if the explicitly selected target is unavailable.
+
 A normally completed turn gets a durable delivery receipt; the agent separately
 chooses whether to complete, snooze, or cancel the reminder. Pending reminders
 already delivered remain inspectable with `buzz reminders list`; they do not
