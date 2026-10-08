@@ -13,6 +13,9 @@
 //!   still queue normally.
 //! - **Queue** — all events accumulate; batched on the next flush cycle.
 
+mod deployment;
+pub(crate) use deployment::Snapshot;
+
 use nostr::{Event, ToBech32};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -96,7 +99,7 @@ const IN_FLIGHT_DEADLINE_BUFFER_SECS: u64 = 100;
 const DEFAULT_IN_FLIGHT_DEADLINE_SECS: u64 = 7300;
 
 /// An event waiting in the queue.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueuedEvent {
     pub channel_id: Uuid,
     /// Session scope resolved once at admission. Under `channel` policy this is
@@ -105,6 +108,7 @@ pub struct QueuedEvent {
     /// channel alone. Invariant: `scope.channel_id() == channel_id`.
     pub scope: SessionScope,
     pub event: Event,
+    #[serde(skip, default = "Instant::now")]
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
@@ -2222,12 +2226,12 @@ mod tests {
 
     /// Conversation scope for a channel — the default scope the queue's own
     /// unit tests exercise (equivalent to the pre-thread-scoping channel key).
-    fn conv(channel_id: Uuid) -> SessionScope {
+    pub(super) fn conv(channel_id: Uuid) -> SessionScope {
         SessionScope::Conversation { channel_id }
     }
 
     /// Build a QueuedEvent for the given channel (conversation scope).
-    fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
+    pub(super) fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
             channel_id,
             scope: conv(channel_id),

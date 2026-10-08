@@ -14,6 +14,8 @@ pub(crate) struct Pending {
     pub delivered: Vec<String>,
     pub standing: bool,
     pub reminder: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<serde_json::Value>,
 }
 
 impl SessionState {
@@ -50,7 +52,11 @@ impl SessionState {
     }
 }
 
-pub(crate) fn begin(agent: &mut OwnedAgent, pending: Pending) -> Result<(), AcpError> {
+pub(crate) fn begin(
+    agent: &mut OwnedAgent,
+    mut pending: Pending,
+    blocks: &[&str],
+) -> Result<(), AcpError> {
     if !agent.acp.recovery_supported() {
         return Ok(());
     }
@@ -58,6 +64,11 @@ pub(crate) fn begin(agent: &mut OwnedAgent, pending: Pending) -> Result<(), AcpE
         return Err(AcpError::Protocol(
             "durable adapter requires a harness session store".into(),
         ));
+    }
+    if agent.acp.accepts_before_preparation() {
+        let mut request = crate::acp::build_prompt_params(&pending.session, blocks);
+        request["_meta"] = serde_json::json!({"axesRecovery": {"attempt": pending.attempt}});
+        pending.request = Some(request);
     }
     agent.acp.set_recovery_attempt(pending.attempt.clone());
     agent.state.turn_active = true;
@@ -89,6 +100,7 @@ pub(crate) async fn run(
             .recover_turn(
                 &pending.session,
                 &pending.attempt,
+                pending.request.as_ref(),
                 ctx.idle_timeout,
                 ctx.max_turn_duration,
             )

@@ -201,6 +201,7 @@ pub struct AcpClient {
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
     recovery_supported: bool,
+    accepts_before_preparation: bool,
     workspace_reuse_supported: bool,
     workspace_reuse_session: Option<String>,
     recovery_attempt: Option<String>,
@@ -565,6 +566,7 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             recovery_supported: false,
+            accepts_before_preparation: false,
             workspace_reuse_supported: false,
             workspace_reuse_session: None,
             recovery_attempt: None,
@@ -631,6 +633,11 @@ impl AcpClient {
             .pointer("/_meta/axesRecovery/version")
             .and_then(|v| v.as_u64())
             == Some(1);
+        self.accepts_before_preparation = self.recovery_supported
+            && result
+                .pointer("/_meta/axesRecovery/acceptBeforePreparation")
+                .and_then(|v| v.as_bool())
+                == Some(true);
         self.workspace_reuse_supported = result
             .pointer("/_meta/axesWorkspaceReuse/version")
             .and_then(|v| v.as_u64())
@@ -842,6 +849,11 @@ impl AcpClient {
         self.recovery_supported
     }
 
+    /// Whether recovery can safely accept a retained request before preparation.
+    pub fn accepts_before_preparation(&self) -> bool {
+        self.accepts_before_preparation
+    }
+
     /// Bind the next prompt to its durable harness checkpoint.
     pub fn set_recovery_attempt(&mut self, attempt: String) {
         self.recovery_attempt = Some(attempt);
@@ -852,16 +864,24 @@ impl AcpClient {
         &mut self,
         session_id: &str,
         attempt: &str,
+        original_request: Option<&serde_json::Value>,
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
         if !self.recovery_supported {
             return Err(AcpError::Protocol("adapter lacks durable recovery".into()));
         }
+        let mut params = serde_json::json!({"sessionId": session_id, "attempt": attempt});
+        if let Some(request) = original_request {
+            if !self.accepts_before_preparation {
+                return Err(AcpError::Protocol("adapter lacks early acceptance".into()));
+            }
+            params["originalRequest"] = request.clone();
+        }
         self.prompt_request(
             "_axes/recover",
             session_id,
-            serde_json::json!({"sessionId": session_id, "attempt": attempt}),
+            params,
             idle_timeout,
             max_duration,
         )
@@ -2178,7 +2198,7 @@ impl AcpClient {
 }
 
 /// Build `session/prompt` params from one or more text content blocks.
-fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
+pub(crate) fn build_prompt_params(session_id: &str, prompt_blocks: &[&str]) -> serde_json::Value {
     let blocks: Vec<serde_json::Value> = prompt_blocks
         .iter()
         .map(|text| serde_json::json!({ "type": "text", "text": text }))

@@ -2,6 +2,7 @@
 
 mod acp;
 mod config;
+mod deployment_drain;
 mod engram_fetch;
 mod filter;
 mod observer;
@@ -2785,6 +2786,11 @@ async fn tokio_main() -> Result<()> {
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let deployment_drain = deployment_drain::Drain::from_env();
+    let drain_identity = format!("{}:{}", config.relay_url, pubkey_hex);
+    deployment_drain.restore(&drain_identity, &mut queue)?;
+    let startup_deliveries = deployment_drain.startup_events(&queue)?;
+    let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -3028,6 +3034,28 @@ async fn tokio_main() -> Result<()> {
             pool.flush_recovered_reminders(state);
         }
         pool.dispatch_recoveries(&ctx);
+        if let Err(error) = deployment_drain.retire_delivered(&drain_identity) {
+            tracing::error!(%error, "deployment backlog remains retained");
+        }
+        let idle = pool.task_map().is_empty()
+            && pool.join_set.is_empty()
+            && wake_tasks.is_empty()
+            && !any_respawn_in_flight(&crash_history);
+        if deployment_drain.poll(&drain_identity, &queue, idle) {
+            tracing::info!("deployment drain complete; waiting for operator");
+            let stopping = loop {
+                if !deployment_drain.requested() {
+                    break false;
+                }
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break true,
+                    _ = drain_tick.tick() => {}
+                }
+            };
+            if stopping {
+                break;
+            }
+        }
         let next_reminder = match reminders.as_ref().map(|state| state.next()).transpose() {
             Ok(candidate) => candidate.flatten(),
             Err(error) => {
@@ -3041,7 +3069,7 @@ async fn tokio_main() -> Result<()> {
         // unconditionally would complete instantly on every iteration — a
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
-        if config.lazy_pool && !pool_ready {
+        if config.lazy_pool && !pool_ready && !deployment_drain.requested() {
             lazy_wake_work_pending = queue.has_flushable_work() || next_reminder.is_some();
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
@@ -3306,6 +3334,7 @@ async fn tokio_main() -> Result<()> {
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
                         Some(buzz_event) => {
+                            if startup_deliveries.contains(&buzz_event.event.id.to_hex()) { continue; }
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
@@ -3634,7 +3663,8 @@ async fn tokio_main() -> Result<()> {
                             // event data through the optional steer/interrupt
                             // decision.
                             queued.steer_or_interrupt(
-                                config.multiple_event_handling,
+                                if deployment_drain.requested() { MultipleEventHandling::Queue }
+                                else { config.multiple_event_handling },
                                 owner_cache.get(),
                                 &mut pool,
                                 &mut queue,
@@ -3805,6 +3835,7 @@ async fn tokio_main() -> Result<()> {
                     tracing::info!("shutting down");
                     break;
                 }
+                _ = drain_tick.tick() => { None }
             }
         };
 

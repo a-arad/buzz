@@ -1,19 +1,30 @@
 use super::*;
 
 async fn agent(base: &std::path::Path, lose_ack: bool, unknown: bool) -> OwnedAgent {
+    agent_with_acceptance(base, lose_ack, unknown, false).await
+}
+
+async fn agent_with_acceptance(
+    base: &std::path::Path,
+    lose_ack: bool,
+    unknown: bool,
+    early: bool,
+) -> OwnedAgent {
     let program = r#"
 import json,os,sys
 def send(i,value): print(json.dumps(dict(id=i,**value)),flush=True)
 for raw in sys.stdin:
  q=json.loads(raw); m=q['method']; i=q.get('id')
  with open(os.environ['CAPTURE'],'a') as stream: stream.write(raw)
- if m=='initialize': send(i,{'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':True},'_meta':{'axesRecovery':{'version':1}}}})
+ if m=='initialize': send(i,{'result':{'protocolVersion':1,'agentCapabilities':{'loadSession':True},'_meta':{'axesRecovery':{'version':1,'acceptBeforePreparation':os.environ['EARLY']=='true'}}}})
  elif m=='session/load': send(i,{'result':{}})
  elif m=='session/prompt':
   assert q['params']['_meta']['axesRecovery']['attempt']=='same-attempt'
   if os.environ['LOSE_ACK']=='true': os._exit(7)
   send(i,{'result':{'stopReason':'end_turn'}})
  elif m=='_axes/recover':
+  original=q['params'].pop('originalRequest',None)
+  assert (original is not None)==(os.environ['EARLY']=='true')
   assert q['params']=={'sessionId':'retained-session','attempt':'same-attempt'}
   if os.environ['UNKNOWN']=='true': send(i,{'error':{'code':-32603,'message':'native dispatch outcome unknown'}})
   else: send(i,{'result':{'stopReason':'end_turn'}})
@@ -29,6 +40,7 @@ for raw in sys.stdin:
             ),
             ("LOSE_ACK".into(), lose_ack.to_string()),
             ("UNKNOWN".into(), unknown.to_string()),
+            ("EARLY".into(), early.to_string()),
         ],
         false,
     )
@@ -159,6 +171,7 @@ fn recovered_channel_delivery_commits_exact_scope_and_events_atomically() {
         delivered: vec!["original-event".into()],
         standing: true,
         reminder: None,
+        request: None,
     });
     state.checkpoint().unwrap();
     drop(state);
@@ -173,4 +186,92 @@ fn recovered_channel_delivery_commits_exact_scope_and_events_atomically() {
     assert!(state.deliveries[&scope]
         .delivered_event_ids
         .contains("original-event"));
+}
+
+#[tokio::test]
+async fn interrupted_dispatch_retains_exact_request_for_acceptance_recovery() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path();
+    let mut worker = agent_with_acceptance(base, true, false, true).await;
+    worker.state.heartbeat_session = Some("retained-session".into());
+    let ctx = Arc::new(tests::make_prompt_context_no_owner());
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    run_prompt_task(
+        worker,
+        None,
+        Some(PrivatePrompt {
+            text: "original work with precise context".into(),
+            source: PromptSource::Heartbeat,
+            reminder: None,
+        }),
+        Arc::clone(&ctx),
+        tx.clone(),
+        None,
+        "same-attempt".into(),
+    )
+    .await;
+    let mut result = rx.recv().await.unwrap();
+    let retained = result
+        .agent
+        .state
+        .pending_turn
+        .as_ref()
+        .unwrap()
+        .request
+        .clone()
+        .unwrap();
+    result.agent.acp.shutdown().await;
+    drop(result);
+    let restarted = agent_with_acceptance(base, false, false, true).await;
+    crate::turn_recovery::run(restarted, ctx, tx).await;
+    let mut result = rx.recv().await.unwrap();
+    assert!(result.agent.state.pending_turn.is_none());
+    result.agent.acp.shutdown().await;
+    let calls: Vec<serde_json::Value> = std::fs::read_to_string(base.join("wire.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let prompts: Vec<_> = calls
+        .iter()
+        .filter(|c| c["method"] == "session/prompt")
+        .collect();
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0]["params"], retained);
+    assert_eq!(
+        calls
+            .iter()
+            .find(|c| c["method"] == "_axes/recover")
+            .unwrap()["params"]["originalRequest"],
+        retained
+    );
+}
+
+#[tokio::test]
+async fn deployment_blocks_new_claims_but_keeps_existing_native_session() {
+    let temporary = tempfile::tempdir().unwrap();
+    let worker = agent(temporary.path(), false, false).await;
+    let mut pool = AgentPool::from_slots(vec![Some(worker)]);
+    pool.deployment_drain.root = Some(temporary.path().into());
+    let owner = pool.try_claim(None).unwrap();
+    std::fs::write(temporary.path().join("deployment-drain.request"), "request").unwrap();
+    pool.return_agent(owner);
+    assert!(pool.try_claim(None).is_none());
+    assert!(pool.try_claim_reminder("new-reminder").is_none());
+    assert!(pool.agents[0].is_some());
+    std::fs::remove_file(temporary.path().join("deployment-drain.request")).unwrap();
+    let mut owner = pool.try_claim(None).unwrap();
+    owner.acp.shutdown().await;
+}
+
+#[test]
+fn original_request_matches_shared_acceptance_contract() {
+    let contract: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../contracts/axes-request-acceptance.json"
+    ))
+    .unwrap();
+    let mut params = crate::acp::build_prompt_params("retained-session", &["original task"]);
+    params["_meta"] = serde_json::json!({"axesRecovery": {"attempt": "same-attempt"}});
+    assert_eq!(params, contract["prompt"]);
+    assert_eq!(params, contract["recovery"]["originalRequest"]);
 }

@@ -430,3 +430,37 @@ its in-memory mappings. Reconstruct and verify the exact identity/scope/session
 references and delivery state from retained local evidence before the first idle
 restart. If any reference is ambiguous, leave that service running until resolved.
 Keep reminder receipts, native histories, workspaces, and provider settings intact.
+
+### Private deployment drain for commissioned native adapters
+
+With `BUZZ_ACP_SESSION_STORE` configured, an operator can create a private
+`deployment-drain.request` file in that store. Its contents are an opaque request
+token. New channel, heartbeat and reminder claims stop; accepted turns and native
+receipt recovery finish. The harness keeps receiving ordinary channel traffic
+into its queue while those turns finish. No model prompt or conversation control
+message is needed.
+
+Only after tasks settle and the queue is saved does the harness write
+`deployment-drain.json` with `state: drained`, its PID, identity and exact request
+contents. Verify PID and token before stopping the process, under the deployment
+owner's existing lock. Persistence failures leave the process and work running,
+with a `deployment drain blocked` diagnostic. Removing the request resumes claims.
+Preserve `deployment-backlog.json`, conversation checkpoints and reminder receipts
+when installing the next binary. Queued event scopes and retry budgets survive;
+events already represented by pending or completed deliveries are not replayed.
+
+Use the existing one-start `--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR` to cover relay
+arrivals during the restart window (capture the floor before requesting drain,
+with a clock-skew overlap). Startup suppresses IDs already represented by retained
+checkpoints or the restored backlog. Clear the one-start override after verifying
+startup; it is not a permanent invitation to replay historical traffic. Legacy
+binaries cannot acknowledge this drain: their first handoff requires explicit
+operator reconciliation, including queued relay traffic and any rotated sessions.
+
+An adapter advertising `_meta.axesRecovery.acceptBeforePreparation: true` promises
+to durably accept a request before preparatory work or native execution. The
+harness saves the exact prompt parameters with its pending attempt. After a lost
+transport it supplies `originalRequest` through `_axes/recover`, retaining the
+same attempt and conversation. Adapters without this capability retain the
+existing receipt-only recovery behavior. Unknown legacy holds are never silently
+converted to new prompts.
