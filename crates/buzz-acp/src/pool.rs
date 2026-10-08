@@ -377,6 +377,7 @@ impl OwnedAgent {
 /// (running inside a spawned task). The `task_map` tracks in-flight
 /// tasks for panic recovery.
 pub struct AgentPool {
+    pub(crate) deployment_drain: crate::deployment_drain::Drain,
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
@@ -914,6 +915,7 @@ impl AgentPool {
             .collect();
         Self {
             agents: slots,
+            deployment_drain: crate::deployment_drain::Drain::from_env(),
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
@@ -997,6 +999,9 @@ impl AgentPool {
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
+        if self.deployment_drain.requested() {
+            return None;
+        }
         self.restore_reminder_owners();
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
@@ -1024,6 +1029,9 @@ impl AgentPool {
 
     /// Keep retries on their original worker, including while that worker is busy.
     pub(crate) fn try_claim_reminder(&mut self, event: &str) -> Option<OwnedAgent> {
+        if self.deployment_drain.requested() {
+            return None;
+        }
         self.restore_reminder_owners();
         if let Some(&index) = self.reminder_owners.get(event) {
             let slot = self.agents.get_mut(index)?;
@@ -2931,8 +2939,9 @@ pub async fn run_prompt_task(
                 delivered: Vec::new(),
                 standing: !agent.has_system_prompt_support(),
                 reminder: None,
+                request: None,
             };
-            if let Err(error) = crate::turn_recovery::begin(&mut agent, pending) {
+            if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &[&init_msg]) {
                 send_prompt_result(
                     &result_tx,
                     &turn_id,
@@ -3286,8 +3295,9 @@ pub async fn run_prompt_task(
         delivered: pending_delivered_event_ids.iter().cloned().collect(),
         standing: !agent.has_system_prompt_support(),
         reminder: recovery_reminder.clone(),
+        request: None,
     };
-    if let Err(error) = crate::turn_recovery::begin(&mut agent, pending) {
+    if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &prompt_blocks) {
         send_prompt_result(
             &result_tx,
             &turn_id,
