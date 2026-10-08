@@ -434,19 +434,20 @@ Keep reminder receipts, native histories, workspaces, and provider settings inta
 ### Private deployment drain for commissioned native adapters
 
 With `BUZZ_ACP_SESSION_STORE` configured, an operator can create a private
-`deployment-drain.request` file in that store. Its contents are an opaque request
+`deployment/request` file in that store. Its contents are an opaque request
 token. New channel, heartbeat and reminder claims stop; accepted turns and native
 receipt recovery finish. The harness keeps receiving ordinary channel traffic
 into its queue while those turns finish. No model prompt or conversation control
 message is needed.
 
 Only after tasks settle and the queue is saved does the harness write
-`deployment-drain.json` with `state: drained`, its PID, identity and exact request
+`deployment/drain.json` with `state: drained`, its PID, identity and exact request
 contents. Verify PID and token before stopping the process, under the deployment
 owner's existing lock. Persistence failures leave the process and work running,
 with a `deployment drain blocked` diagnostic. Removing the request resumes claims.
-Preserve `deployment-backlog.json`, conversation checkpoints and reminder receipts
-when installing the next binary. Queued event scopes and retry budgets survive;
+Preserve `deployment/backlog.json`, conversation checkpoints and reminder receipts
+when installing the next binary. Drain files stay below `deployment/` so
+existing conversation inspectors do not mistake them for conversation checkpoints. Queued event scopes and retry budgets survive;
 events already represented by pending or completed deliveries are not replayed.
 
 Use the existing one-start `--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR` to cover relay

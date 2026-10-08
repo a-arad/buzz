@@ -254,12 +254,13 @@ async fn deployment_blocks_new_claims_but_keeps_existing_native_session() {
     let mut pool = AgentPool::from_slots(vec![Some(worker)]);
     pool.deployment_drain.root = Some(temporary.path().into());
     let owner = pool.try_claim(None).unwrap();
-    std::fs::write(temporary.path().join("deployment-drain.request"), "request").unwrap();
+    std::fs::create_dir(temporary.path().join("deployment")).unwrap();
+    std::fs::write(temporary.path().join("deployment/request"), "request").unwrap();
     pool.return_agent(owner);
     assert!(pool.try_claim(None).is_none());
     assert!(pool.try_claim_reminder("new-reminder").is_none());
     assert!(pool.agents[0].is_some());
-    std::fs::remove_file(temporary.path().join("deployment-drain.request")).unwrap();
+    std::fs::remove_file(temporary.path().join("deployment/request")).unwrap();
     let mut owner = pool.try_claim(None).unwrap();
     owner.acp.shutdown().await;
 }

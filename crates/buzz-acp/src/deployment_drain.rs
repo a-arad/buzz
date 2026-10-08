@@ -27,17 +27,27 @@ impl Drain {
     }
 
     pub(crate) fn requested(&self) -> bool {
-        self.root.as_ref().is_some_and(|root| {
-            root.join("deployment-drain.request")
-                .try_exists()
-                .unwrap_or(true)
-        })
+        self.root
+            .as_ref()
+            .is_some_and(|root| root.join("deployment/request").try_exists().unwrap_or(true))
     }
 
     fn write(&self, name: &str, value: &impl Serialize) -> Result<()> {
         let Some(root) = &self.root else {
             anyhow::bail!("drain requires a durable session store")
         };
+        let parent = root;
+        let root = root.join("deployment");
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&root)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
         let temporary = root.join(format!(".drain-{}", uuid::Uuid::new_v4()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -57,7 +67,7 @@ impl Drain {
             file.sync_all()?;
             fs::rename(&temporary, root.join(name))?;
             #[cfg(unix)]
-            fs::File::open(root)?.sync_all()?;
+            fs::File::open(&root)?.sync_all()?;
             Ok(())
         })();
         if temporary.exists() {
@@ -148,7 +158,7 @@ impl Drain {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let path = root.join("deployment-backlog.json");
+        let path = root.join("deployment/backlog.json");
         if !path.try_exists()? {
             return Ok(());
         }
@@ -169,7 +179,7 @@ impl Drain {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let path = root.join("deployment-backlog.json");
+        let path = root.join("deployment/backlog.json");
         if !path.try_exists()? {
             return Ok(());
         }
@@ -187,9 +197,9 @@ impl Drain {
         if saved.queue.events.is_empty() {
             fs::remove_file(path)?;
             #[cfg(unix)]
-            fs::File::open(root)?.sync_all()?;
+            fs::File::open(root.join("deployment"))?.sync_all()?;
         } else if saved.queue.events.len() != before {
-            self.write("deployment-backlog.json", &saved)?;
+            self.write("backlog.json", &saved)?;
         }
         Ok(())
     }
@@ -209,7 +219,7 @@ impl Drain {
 
     pub(crate) fn ready(&self, identity: &str, queue: &EventQueue) -> Result<()> {
         self.write(
-            "deployment-backlog.json",
+            "backlog.json",
             &Backlog {
                 identity: identity.to_owned(),
                 queue: queue.deployment_snapshot()?,
@@ -219,10 +229,10 @@ impl Drain {
             anyhow::bail!("drain requires a session store")
         };
         self.write(
-            "deployment-drain.json",
+            "drain.json",
             &serde_json::json!({
                 "state": "drained", "pid": std::process::id(), "identity": identity,
-                "request": String::from_utf8(Self::read(&root.join("deployment-drain.request"))?)?,
+                "request": String::from_utf8(Self::read(&root.join("deployment/request"))?)?,
             }),
         )
     }

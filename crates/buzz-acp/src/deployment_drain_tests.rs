@@ -25,15 +25,21 @@ fn only_idle_durable_work_can_acknowledge_the_current_request() {
     let drain = Drain {
         root: Some(root.path().into()),
     };
+    fs::create_dir(root.path().join("deployment")).unwrap();
     let mut queue = EventQueue::new(DedupMode::Queue);
     queue.push(queued("unstarted research question"));
     assert!(!drain.poll("identity", &queue, true));
-    fs::write(root.path().join("deployment-drain.request"), "nonce-1").unwrap();
+    fs::write(root.path().join("deployment/request"), "nonce-1").unwrap();
     assert!(!drain.poll("identity", &queue, false));
-    assert!(!root.path().join("deployment-drain.json").exists());
+    assert!(!root.path().join("deployment/drain.json").exists());
     assert!(drain.poll("identity", &queue, true));
+    assert!(fs::read_dir(root.path()).unwrap().all(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .is_none_or(|ext| ext != "json")));
     let ack: serde_json::Value =
-        serde_json::from_slice(&fs::read(root.path().join("deployment-drain.json")).unwrap())
+        serde_json::from_slice(&fs::read(root.path().join("deployment/drain.json")).unwrap())
             .unwrap();
     assert_eq!(ack["request"], "nonce-1");
     assert_eq!(ack["pid"], std::process::id());
@@ -50,7 +56,7 @@ fn only_idle_durable_work_can_acknowledge_the_current_request() {
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            fs::metadata(root.path().join("deployment-backlog.json"))
+            fs::metadata(root.path().join("deployment/backlog.json"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -66,12 +72,13 @@ fn failed_snapshot_never_acknowledges_or_discards_queued_events() {
     let drain = Drain {
         root: Some(root.path().into()),
     };
+    fs::create_dir(root.path().join("deployment")).unwrap();
     let mut queue = EventQueue::new(DedupMode::Queue);
     queue.push(queued("preserve me"));
-    fs::write(root.path().join("deployment-drain.request"), "nonce").unwrap();
-    fs::create_dir(root.path().join("deployment-backlog.json")).unwrap();
+    fs::write(root.path().join("deployment/request"), "nonce").unwrap();
+    fs::create_dir(root.path().join("deployment/backlog.json")).unwrap();
     assert!(!drain.poll("identity", &queue, true));
-    assert!(!root.path().join("deployment-drain.json").exists());
+    assert!(!root.path().join("deployment/drain.json").exists());
     assert_eq!(queue.deployment_snapshot().unwrap().events.len(), 1);
 }
 
@@ -81,6 +88,7 @@ fn accepted_and_completed_events_are_pruned_before_replaying_a_backlog() {
     let drain = Drain {
         root: Some(root.path().into()),
     };
+    fs::create_dir(root.path().join("deployment")).unwrap();
     let mut queue = EventQueue::new(DedupMode::Queue);
     let accepted = queued("already accepted");
     let completed = queued("already published");
@@ -88,7 +96,7 @@ fn accepted_and_completed_events_are_pruned_before_replaying_a_backlog() {
     for event in [&accepted, &completed, &waiting] {
         queue.push(event.clone());
     }
-    fs::write(root.path().join("deployment-drain.request"), "nonce").unwrap();
+    fs::write(root.path().join("deployment/request"), "nonce").unwrap();
     assert!(drain.poll("identity", &queue, true));
     fs::write(
         root.path().join("0.json"),
@@ -111,5 +119,5 @@ fn accepted_and_completed_events_are_pruned_before_replaying_a_backlog() {
     assert_eq!(snapshot.events[0].event.id, waiting.event.id);
     fs::write(root.path().join("0.json"), b"corrupt checkpoint").unwrap();
     assert!(drain.restore("identity", &mut restored).is_err());
-    assert!(root.path().join("deployment-backlog.json").exists());
+    assert!(root.path().join("deployment/backlog.json").exists());
 }
