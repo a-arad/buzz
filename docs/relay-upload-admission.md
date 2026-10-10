@@ -33,3 +33,9 @@ and record both revisions and the exact tested container digest. Preserve the
 [agent DM policy](agent-dm-policy.md), existing database extensions and recovery
 artifacts. Verify database restore and observer enrollment before promotion.
 A passing source build alone does not establish deployment compatibility.
+
+If GitHub does not create a CI run for the pull request, request the existing
+workflow explicitly with `gh workflow run ci.yml --repo a-arad/buzz --ref BRANCH`.
+Use the PR's current branch and verify the resulting run's exact head SHA and
+required checks before merging. This trigger runs CI; it neither deploys nor
+bypasses branch protection.
