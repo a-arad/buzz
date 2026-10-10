@@ -679,7 +679,7 @@ class _MessageList extends HookConsumerWidget {
           mainAxisSize: MainAxisSize.min,
           children: [
             Icon(
-              LucideIcons.messageSquare,
+              BuzzIcons.messageSquare,
               size: Grid.xl,
               color: context.colors.onSurfaceVariant,
             ),
@@ -851,6 +851,7 @@ class _MessageList extends HookConsumerWidget {
                           _MessageBubble(
                             message: message,
                             showAuthor: showAuthor,
+                            hasReplies: entry.summary != null,
                             channelNames: channelNamesMap,
                             currentChannelId: channelId,
                             currentPubkey: currentPubkey,
@@ -913,7 +914,7 @@ class _MessageList extends HookConsumerWidget {
                   backgroundColor: context.colors.primaryContainer,
                   foregroundColor: context.colors.onPrimaryContainer,
                 ),
-                icon: const Icon(LucideIcons.chevronUp, size: 20),
+                icon: const Icon(BuzzIcons.chevronUp, size: 20),
               ),
             ),
           )

@@ -229,7 +229,7 @@ pub async fn get_user_by_nip05(
 ///
 /// Without this, a search query of `"%"` would match every row (full table
 /// scan) and `"_"` would act as a single-character wildcard.
-fn escape_like(input: &str) -> String {
+pub(crate) fn escape_like(input: &str) -> String {
     input
         .replace('\\', "\\\\")
         .replace('%', "\\%")
@@ -387,6 +387,21 @@ pub async fn get_agent_channel_policy(
         Ok((policy, owner))
     })
     .transpose()
+}
+
+/// List the agents whose `agent_owner_pubkey` is `owner_pubkey` in one community.
+pub async fn list_agents_for_owner(
+    pool: &PgPool,
+    community_id: CommunityId,
+    owner_pubkey: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    Ok(sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT pubkey FROM users WHERE community_id = $1 AND agent_owner_pubkey = $2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(owner_pubkey)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// Check whether `actor_pubkey` is the `agent_owner_pubkey` of `target_pubkey`.
@@ -566,6 +581,16 @@ impl Db {
         pubkey: &[u8],
     ) -> Result<Option<(String, Option<Vec<u8>>)>> {
         crate::user::get_agent_channel_policy(&self.pool, community_id, pubkey).await
+    }
+
+    /// List the agents owned by `owner_pubkey` in one community.
+    #[datastore_span(name = "list_agents_for_owner", system = "postgresql")]
+    pub async fn list_agents_for_owner(
+        &self,
+        community_id: CommunityId,
+        owner_pubkey: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        crate::user::list_agents_for_owner(&self.pool, community_id, owner_pubkey).await
     }
 
     /// Check whether `actor_pubkey` is the agent owner of `target_pubkey`.
