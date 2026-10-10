@@ -31,11 +31,19 @@ impl AgentPool {
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
+        let fenced_scopes: HashSet<_> = saved
+            .iter()
+            .filter(|(g, _, _)| *g != 0)
+            .map(|(_, _, scope)| scope.clone())
+            .collect();
         // Newer persisted fences win when an older worker had not yet returned
         // when the process stopped. Legacy checkpoints have no fence.
         saved.sort_by_key(|(generation, index, _)| (*generation, *index));
         for (generation, index, scope) in saved {
-            if generation == 0 && legacy_counts.get(&scope).copied().unwrap_or(0) > 1 {
+            if generation == 0
+                && (fenced_scopes.contains(&scope)
+                    || legacy_counts.get(&scope).copied().unwrap_or(0) > 1)
+            {
                 // Preserve the legacy first-idle affinity until an actual
                 // dispatch establishes the first authoritative fence. Choosing
                 // a worker by slot number here would invent conversation history.
