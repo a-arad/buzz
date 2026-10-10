@@ -2,6 +2,65 @@ use super::super::probe_codex_acp_version_with_path;
 
 #[cfg(unix)]
 #[test]
+fn probe_codex_acp_version_returns_version_when_descendant_holds_pipe_open() {
+    let _guard = crate::managed_agents::lock_path_mutex();
+    super::super::login_shell_spawn_probe::run_in_isolated_process(|| {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Instant;
+
+        // Other discovery tests mutate PATH and its caches. Own this fixture in
+        // a fresh process, and exercise the production probe with an explicit
+        // PATH; augmented-path construction has separate coverage below.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bin = dir.path().join("codex-acp");
+        let pid_file = bin.with_extension("pid");
+        struct DescendantCleanup(std::path::PathBuf);
+        impl Drop for DescendantCleanup {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        if pid > 0 {
+                            // SAFETY: the PID was written by our private fixture.
+                            unsafe { libc::kill(pid, libc::SIGKILL) };
+                        }
+                    }
+                }
+            }
+        }
+        let _cleanup = DescendantCleanup(pid_file.clone());
+        std::fs::write(
+            &bin,
+            "#!/bin/sh\n/bin/sleep 60 &\nprintf '%s\\n' \"$!\" > \"$0.pid\"\necho '@agentclientprotocol/codex-acp 1.1.2'\nexit 0\n",
+        )
+        .expect("write script");
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let start = Instant::now();
+        let version = probe_codex_acp_version_with_path(&bin, Some("/usr/bin:/bin"));
+        let elapsed = start.elapsed();
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("fixture must start a descendant before reporting its version")
+            .trim()
+            .parse()
+            .expect("descendant PID");
+        assert!(pid > 0);
+        // SAFETY: signal zero only checks whether our fixture descendant exists.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "descendant must still hold stdout"
+        );
+        assert!(
+            elapsed.as_secs() < 10,
+            "probe blocked on descendant: {elapsed:?}"
+        );
+        assert_eq!(version, Some((1, 1, 2)), "version probe: {elapsed:?}");
+    });
+}
+
+#[cfg(unix)]
+#[test]
 fn probe_codex_acp_version_uses_augmented_path_for_env_shebang_interpreter() {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

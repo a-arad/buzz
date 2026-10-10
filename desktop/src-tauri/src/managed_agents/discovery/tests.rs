@@ -798,50 +798,6 @@ fn probe_codex_acp_version_returns_none_for_hung_direct_child() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn probe_codex_acp_version_returns_version_when_descendant_holds_pipe_open() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::time::Instant;
-
-    // Simulate a process that forks a background child which inherits stdout
-    // and stays alive, while the parent writes version and exits 0.
-    //
-    // The probe writes the child's stdout to a temp file, then reads from the
-    // file after the parent process exits.  Because the file has reached EOF
-    // (the parent closed its write end), read_to_end() returns immediately
-    // without waiting for the descendant to close its inherited fd.
-    //
-    // `sleep 60 &` starts a descendant that inherits the parent's stdout fd
-    // without making the direct child wait for a nested subshell to exit.
-    let dir = std::env::temp_dir().join(format!("buzz-probe-descendant-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let bin = dir.join("codex-acp");
-    std::fs::write(
-        &bin,
-        "#!/bin/sh\necho '@agentclientprotocol/codex-acp 1.1.2'\nsleep 60 &\nexit 0\n",
-    )
-    .expect("write script");
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod script");
-
-    let start = Instant::now();
-    let version = probe_codex_acp_version(&bin);
-    let elapsed = start.elapsed();
-    let _ = std::fs::remove_dir_all(dir);
-
-    // Must return within ~1 s: non-blocking read, no waiting for descendant.
-    // Give a 9 s margin for parallel pre-push suites.
-    assert!(
-        elapsed.as_secs() < 10,
-        "probe must not block on descendant pipe; elapsed: {elapsed:?}"
-    );
-    assert_eq!(
-        version,
-        Some((1, 1, 2)),
-        "version must be parsed even when descendant holds pipe open"
-    );
-}
-
 // ── parse_semver_tag ──────────────────────────────────────────────────────────
 
 #[test]
