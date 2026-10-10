@@ -34,6 +34,24 @@ pub fn verify_blossom_auth_event_for_verb(
     server_domain: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
+    verify_blossom_auth_event_for_verb_at(
+        auth_event,
+        verb,
+        server_domain,
+        max_age_secs,
+        nostr::Timestamp::now(),
+    )
+}
+
+/// Verify auth at a server-captured admission time, before reading an upload body.
+/// Never use a client-supplied timestamp for `admitted_at`.
+pub fn verify_blossom_auth_event_for_verb_at(
+    auth_event: &nostr::Event,
+    verb: BlossomVerb,
+    server_domain: Option<&str>,
+    max_age_secs: u64,
+    admitted_at: nostr::Timestamp,
+) -> Result<(), MediaError> {
     // 1. Verify Schnorr signature
     auth_event
         .verify()
@@ -89,7 +107,7 @@ pub fn verify_blossom_auth_event_for_verb(
     if !found_exp {
         return Err(MediaError::MissingTag("expiration"));
     }
-    let now = nostr::Timestamp::now().as_secs();
+    let now = admitted_at.as_secs();
     if exp_value <= now {
         return Err(MediaError::TokenExpired);
     }
@@ -178,11 +196,32 @@ pub fn verify_blossom_upload_auth(
     server_domain: Option<&str>,
     max_age_secs: u64,
 ) -> Result<(), MediaError> {
-    verify_blossom_auth_event_for_verb(
+    verify_blossom_upload_auth_at(
+        auth_event,
+        sha256,
+        server_domain,
+        max_age_secs,
+        nostr::Timestamp::now(),
+    )
+}
+
+/// Verify an upload body using the server's pre-body admission timestamp.
+/// This retains expiry and media-specific age limits at admission even when
+/// transferring the body outlasts the proof. `admitted_at` must not come from
+/// the client or from the proof's own timestamp.
+pub fn verify_blossom_upload_auth_at(
+    auth_event: &nostr::Event,
+    sha256: &str,
+    server_domain: Option<&str>,
+    max_age_secs: u64,
+    admitted_at: nostr::Timestamp,
+) -> Result<(), MediaError> {
+    verify_blossom_auth_event_for_verb_at(
         auth_event,
         BlossomVerb::Upload,
         server_domain,
         max_age_secs,
+        admitted_at,
     )?;
 
     // At least one x tag must match the body sha256 (BUD-11 §6)
@@ -263,6 +302,104 @@ mod tests {
         let sha256 = "a".repeat(64);
         let event = build_valid_auth(&keys, &sha256);
         assert!(verify_blossom_upload_auth(&event, &sha256, None, 600).is_ok());
+    }
+
+    fn timed_upload_auth(created_at: u64, expires_at: u64) -> nostr::Event {
+        EventBuilder::new(Kind::from(24242), "Upload admission test")
+            .custom_created_at(Timestamp::from(created_at))
+            .tags([
+                Tag::parse(["t", "upload"]).unwrap(),
+                Tag::parse(["x", &"a".repeat(64)]).unwrap(),
+                Tag::parse(["server", "relay.example"]).unwrap(),
+                Tag::parse(["expiration", &expires_at.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .unwrap()
+    }
+
+    #[test]
+    fn upload_expiry_is_evaluated_at_admission() {
+        let event = timed_upload_auth(1_000, 1_060);
+        let sha256 = "a".repeat(64);
+        for admitted_at in [1_000, 1_059] {
+            assert!(verify_blossom_upload_auth_at(
+                &event,
+                &sha256,
+                Some("relay.example"),
+                600,
+                Timestamp::from(admitted_at),
+            )
+            .is_ok());
+        }
+        for admitted_at in [1_060, 1_070] {
+            assert!(matches!(
+                verify_blossom_upload_auth_at(
+                    &event,
+                    &sha256,
+                    Some("relay.example"),
+                    600,
+                    Timestamp::from(admitted_at),
+                ),
+                Err(MediaError::TokenExpired)
+            ));
+        }
+        assert!(matches!(
+            verify_blossom_upload_auth(&event, &sha256, Some("relay.example"), 600,),
+            Err(MediaError::TokenExpired)
+        ));
+    }
+
+    #[test]
+    fn upload_admission_preserves_media_age_windows() {
+        let event = timed_upload_auth(1_000, 5_000);
+        let sha256 = "a".repeat(64);
+        for (max_age, admitted_at, accepted) in [
+            (600, 1_600, true),
+            (600, 1_601, false),
+            (3_600, 1_601, true),
+            (3_600, 4_600, true),
+            (3_600, 4_601, false),
+            (600, 994, false),
+        ] {
+            let result = verify_blossom_upload_auth_at(
+                &event,
+                &sha256,
+                Some("relay.example"),
+                max_age,
+                Timestamp::from(admitted_at),
+            );
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(MediaError::TimestampOutOfWindow)));
+            }
+        }
+    }
+
+    #[test]
+    fn upload_admission_preserves_hash_and_server_binding() {
+        let event = timed_upload_auth(1_000, 1_060);
+        let admitted_at = Timestamp::from(1_000);
+        assert!(matches!(
+            verify_blossom_upload_auth_at(
+                &event,
+                &"b".repeat(64),
+                Some("relay.example"),
+                600,
+                admitted_at,
+            ),
+            Err(MediaError::HashMismatch)
+        ));
+        assert!(matches!(
+            verify_blossom_upload_auth_at(
+                &event,
+                &"a".repeat(64),
+                Some("other.example"),
+                600,
+                admitted_at,
+            ),
+            Err(MediaError::ServerMismatch)
+        ));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::state::AppState;
 /// extractors, so auth rejection happens before any body buffering.
 pub(crate) struct AuthenticatedUpload {
     auth_event: nostr::Event,
+    admitted_at: nostr::Timestamp,
     /// Community resolved from the request host at extraction time (row zero for
     /// this HTTP door), identical to the WS door in `router.rs` and the bridge
     /// door in `bridge.rs`. Server-resolved, never client-supplied.
@@ -170,11 +171,16 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
 
         // 2. Extract and validate Blossom auth event against the bound host.
         let auth_event = extract_blossom_auth(headers)?;
-        // Use the permissive window (3600s) here because we don't know the
-        // content type yet.  The upload functions re-verify with the correct
-        // per-type window (600s for images, 3600s for video) after the body
-        // has been consumed and the SHA-256 computed.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
+        let admitted_at = nostr::Timestamp::now();
+        // Reuse admission time for the media-specific check after body transfer.
+        // The common gate uses the video window until actual bytes select a type.
+        buzz_media::auth::verify_blossom_auth_event_for_verb_at(
+            &auth_event,
+            buzz_media::auth::BlossomVerb::Upload,
+            Some(tenant.host()),
+            3600,
+            admitted_at,
+        )?;
 
         // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
         let claimed_hash = headers
@@ -230,6 +236,7 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
 
         Ok(AuthenticatedUpload {
             auth_event,
+            admitted_at,
             tenant,
             route_mode,
             _upload_permit: upload_permit,
@@ -346,6 +353,7 @@ pub async fn upload_blob(
             &state.config.media,
             &auth.tenant,
             &auth.auth_event,
+            auth.admitted_at,
             replay,
             content_length,
             attribution,
@@ -377,6 +385,7 @@ pub async fn upload_blob(
                 &state.config.media,
                 &auth.tenant,
                 &auth.auth_event,
+                auth.admitted_at,
                 bytes,
                 attribution,
             )
@@ -392,6 +401,7 @@ pub async fn upload_blob(
                 &state.config.media,
                 &auth.tenant,
                 &auth.auth_event,
+                auth.admitted_at,
                 bytes,
                 attribution,
             )

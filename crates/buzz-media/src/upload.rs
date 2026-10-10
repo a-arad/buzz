@@ -5,7 +5,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::auth::verify_blossom_upload_auth;
+use crate::auth::verify_blossom_upload_auth_at;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::storage::{BlobMeta, MediaStorage};
@@ -47,6 +47,7 @@ struct BufferedUploadInput<'a> {
     config: &'a MediaConfig,
     ctx: &'a TenantContext,
     auth_event: &'a nostr::Event,
+    admitted_at: nostr::Timestamp,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 }
@@ -66,6 +67,7 @@ where
         config,
         ctx,
         auth_event,
+        admitted_at,
         body,
         attribution,
     } = input;
@@ -82,7 +84,7 @@ where
         let (mime, ext) = validate(&bytes, &cfg)?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         // Buffered uploads (image + file): 10-minute auth window is plenty.
-        verify_blossom_upload_auth(&auth, &sha256, Some(bound_host.as_str()), 600)?;
+        verify_blossom_upload_auth_at(&auth, &sha256, Some(bound_host.as_str()), 600, admitted_at)?;
         Ok((mime, sha256, ext))
     })
     .await
@@ -204,11 +206,13 @@ struct MetadataInput {
 ///
 /// This is the image path — body is already fully buffered in RAM. Do NOT use
 /// this for video uploads; use [`process_video_upload`] instead.
+/// `admitted_at` is captured by the relay before auth verification and body reads.
 pub async fn process_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
     auth_event: &nostr::Event,
+    admitted_at: nostr::Timestamp,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
@@ -218,6 +222,7 @@ pub async fn process_upload(
             config,
             ctx,
             auth_event,
+            admitted_at,
             body,
             attribution,
         },
@@ -242,11 +247,13 @@ pub async fn process_upload(
 ///
 /// The resulting blob is served with `Content-Disposition: attachment`, so the
 /// client always downloads it rather than rendering it inline.
+/// `admitted_at` is captured by the relay before auth verification and body reads.
 pub async fn process_file_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
     auth_event: &nostr::Event,
+    admitted_at: nostr::Timestamp,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
@@ -256,6 +263,7 @@ pub async fn process_file_upload(
             config,
             ctx,
             auth_event,
+            admitted_at,
             body,
             attribution,
         },
@@ -289,11 +297,14 @@ pub async fn process_file_upload(
 /// 5. Writes a sidecar with `duration_secs` (no thumbnail — desktop handles that).
 ///
 /// Returns a [`BlobDescriptor`] with the `duration` field populated.
+/// `admitted_at` is captured by the relay before auth verification and body reads.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_video_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
     auth_event: &nostr::Event,
+    admitted_at: nostr::Timestamp,
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
     attribution: Option<UploadAttribution>,
@@ -409,7 +420,13 @@ pub async fn process_video_upload(
     let bound_host = ctx.host().to_string();
     tokio::task::spawn_blocking(move || {
         // Videos: 1-hour window — large uploads on slow connections need headroom.
-        verify_blossom_upload_auth(&auth, &sha256_for_auth, Some(bound_host.as_str()), 3600)
+        verify_blossom_upload_auth_at(
+            &auth,
+            &sha256_for_auth,
+            Some(bound_host.as_str()),
+            3600,
+            admitted_at,
+        )
     })
     .await
     .map_err(|_| MediaError::Internal)??;
