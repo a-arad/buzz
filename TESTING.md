@@ -4,6 +4,8 @@
 
 The optional deployment DM policy has an authenticated HTTP/WebSocket regression
 recipe in [agent-dm-policy.md](docs/agent-dm-policy.md#regression-verification).
+Slow-upload compatibility has a live regression recipe in
+[relay-upload-admission.md](docs/relay-upload-admission.md).
 
 ```bash
 just test-unit          # unit tests — no infrastructure needed
