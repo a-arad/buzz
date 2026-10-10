@@ -1,5 +1,15 @@
 # Slow uploads with short-lived Blossom proofs
 
+The desktop-v0.5.28 integration uses upstream upload validation unchanged.
+Upstream checks time and authority before reading the body and verifies its
+SHA-256 afterward. The custom admission-timestamp implementation has been
+removed from this newer source.
+
+The following describes the separately tested stable relay-v0.2.1 backport
+(`72422be293efcd9456dc52535ca3dc1dd4aadaa0`), whose older media verifier retains
+media-specific age limits. Its legacy-age test expectations apply to that
+stable backport, not the newer upstream verifier.
+
 The relay verifies upload authority before reading a request body. It captures
 one server timestamp at that gate and uses it again when checking the completed
 body. A proof valid on arrival can therefore finish a transfer after its expiry.

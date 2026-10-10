@@ -1,5 +1,10 @@
 # buzz-acp
 
+For one prepared local task, use **`buzz-acp run --task <path|->`**. See
+[Local task runner and version-1 task contract](TASKS.md). With no command,
+`buzz-acp` remains the conversational service.
+
+
 ACP harness that connects AI agents to Buzz. The harness listens for @mentions on the relay, prompts your agent, and the agent replies using the Buzz CLI.
 
 ```
@@ -22,6 +27,57 @@ Build:
 cargo build --release -p buzz-acp
 export PATH="$PWD/target/release:$PATH"
 ```
+
+## Private reminders
+
+Agents can schedule deferred follow-ups with `buzz reminders create --after 7d
+--note 'Inspect experiment X and decide whether to continue' --link
+'buzz://message?channel=<uuid>&id=<event>'`. `--at` accepts an absolute RFC3339
+time with timezone. `list`, `get`, `snooze`, `complete`, and `cancel` manage the
+author's encrypted NIP-ER state; no channel message is published automatically.
+
+On relays advertising NIP-ER and NIP-42, the harness queries the author's current
+reminder heads every 30 seconds, with paginated recovery and no creation-time
+lower bound. Due work uses a fresh private conversation for each exact reminder
+event, after queued messages and without interrupting active work. Retries use
+the same conversation and worker, including after a restart with the durable
+session store. A later snooze has a new event and therefore a new conversation.
+The harness rechecks the head before
+dispatch, so snoozes and cancellations supersede waiting intent. The reminder
+note and target provide context when the originating session no longer exists.
+
+Adapters that create workspaces can advertise `_meta.axesWorkspaceReuse.version = 1`
+in their initialize result. The harness then supplies
+`_meta.axesWorkspaceReuse.sessionId` on fresh reminder `session/new` requests,
+pointing to the worker's existing private workspace owner. This reuses working
+files without copying native conversation history; the adapter must reject
+concurrent writers and verify the owner's retained workspace when loading.
+`contracts/axes-workspace-reuse.json` is shared with the Edamame research adapter.
+Upgrade that adapter before this harness. Standard adapters continue to receive
+their commissioned `cwd`; ordinary channel/thread and heartbeat session policies
+are unchanged. Model and reasoning settings still follow normal session creation.
+
+For a fork release PR targeting a maintained branch other than upstream `main`,
+set `CHECK_BRANCH_SKEW_REMOTE` and `CHECK_BRANCH_SKEW_BRANCH` to its actual remote
+and target when pushing. The overlap guard fetches and checks that target; it
+fails if the explicitly selected target is unavailable.
+
+A normally completed turn gets a durable delivery receipt; the agent separately
+chooses whether to complete, snooze, or cancel the reminder. Pending reminders
+already delivered remain inspectable with `buzz reminders list`; they do not
+repeatedly wake the agent. Failed, interrupted, or limited turns remain eligible
+with per-version backoff. A crash before the receipt is durable can redeliver:
+agents should inspect their retained artifacts before repeating side effects.
+
+Receipts default to `$XDG_STATE_HOME/buzz-acp/reminders` or
+`$HOME/.local/state/buzz-acp/reminders`. Set `BUZZ_ACP_REMINDER_STATE_DIR` to a
+persistent volume in replaceable runtimes. Files are scoped by relay and author;
+an exclusive local lock prevents competing consumers sharing that directory.
+Keep one harness per identity; simultaneous devices do not have distributed
+exactly-once delivery. Losing receipts can redeliver pending reminders, while
+done/cancelled state remains on the relay. Bookmark reminders without a due time
+never wake an agent. Relays lacking the advertised private-read contract disable
+reminder recovery without changing ordinary messaging.
 
 ## Generating Keys
 
@@ -111,8 +167,8 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_AGENT_COMMAND` | no | `goose` | Agent binary to spawn. |
 | `BUZZ_ACP_AGENT_ARGS` | no | `acp` | Agent arguments (comma-separated). |
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
-| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
-| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
+| `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. `0` disables this deadline. |
+| `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn. `0` disables this deadline. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
@@ -192,6 +248,34 @@ buzz-acp --respond-to anyone
 buzz-acp --respond-to nobody --heartbeat-interval 300
 ```
 
+### Host-controlled launch wrapper
+
+On Unix, a trusted host can set `BUZZ_ACP_LAUNCH_PREFIX` to a JSON argument array, for
+example `["/absolute/launcher", "--policy", "/absolute/policy.json", "--"]`.
+Keep `BUZZ_ACP_AGENT_COMMAND` set to the real worker (such as Goose). The harness
+launches `prefix... worker normalized-args...` without a shell, preserving worker
+identity for argument defaults, environment setup, managed skills and ACP handling.
+
+Configured prefixes are rejected on non-Unix platforms, including Windows, because
+per-worker process-tree cleanup is not available there. Unset direct launches
+remain available on every platform.
+
+Hosts must reserve this key against user-supplied environment settings and apply
+the trusted prefix after merging user environment. Desktop's shared reserved-key
+filter covers saved persona/agent settings and local/remote launch environments.
+
+The first prefix element must be an absolute executable path. Unset means direct
+launch; empty, malformed or unusable prefixes fail launch with no direct fallback.
+The shared spawn path applies the prefix to every worker creation, including pool
+startup, wake, crash replacement, local tasks, model discovery and authentication.
+The variable is removed from the child's environment to avoid recursive wrapping.
+
+The wrapper must preserve ACP stdin/stdout and either exec the worker or supervise
+it within the inherited process group. This hook does not enforce a sandbox or
+verify executable contents. The host owns policy, immutable launcher staging and
+its lifetime across delayed launches/restarts. Hosts requiring this hook must pin
+a supporting runtime; older binaries do not understand the environment setting.
+
 ### Configuration Examples
 
 **Single agent, no heartbeat (default):**
@@ -236,16 +320,16 @@ Start with **N=2** for most deployments. Increase if queue depth grows under loa
 
 ## Forum Channels
 
-By default, the ACP harness subscribes to stream message kinds (9, 46010, 40007). To receive forum events, opt in with `--kinds` and disable the mention filter (forum posts don't @mention agents):
+By default, the ACP harness subscribes to actionable stream kinds (9 messages, 40003 edits that add a mention, 46010 workflow approvals, and 40007 reminders). To receive forum events, opt in with `--kinds` and disable the mention filter (forum posts don't @mention agents):
 
 **CLI flags:**
 ```bash
-buzz-acp --kinds 9,46010,40007,45001,45002,45003 --no-mention-filter
+buzz-acp --kinds 9,40003,46010,40007,45001,45002,45003 --no-mention-filter
 ```
 
 **Or with `--subscribe all`:**
 ```bash
-buzz-acp --subscribe all --kinds 9,46010,40007,45001,45002,45003
+buzz-acp --subscribe all --kinds 9,40003,46010,40007,45001,45002,45003
 ```
 
 **Per-channel config:**
@@ -270,6 +354,10 @@ Forum event kinds:
 4. **Prompting** — When events are pending and no prompt is in flight for that channel, drains all queued events for the oldest channel into a single batched prompt via ACP `session/prompt`.
 5. **Agent response** — The agent processes the prompt and uses the Buzz CLI (`send_message`, `get_messages`, etc.) to interact with Buzz.
 6. **Recovery** — If the agent crashes, the harness respawns it. If the relay disconnects, the harness reconnects with a `since` filter to avoid missing events.
+   If the inbound queue overflows, the harness attempts replay for affected
+   subscriptions when capacity and relay quota permit, with at least five seconds
+   between attempts. Recovery depends on available relay history and the consumer
+   making progress; complete delivery is not guaranteed.
 
 Each channel has at most one prompt in flight. Multiple channels can be processed concurrently when agents > 1.
 
@@ -351,3 +439,88 @@ See the [root TESTING.md](../../TESTING.md) for the full integration testing gui
 ## License
 
 Apache-2.0
+
+## Git in coding runtimes
+
+The harness configures agent authorship, Nostr commit/tag signing, and Git
+credentials for native runtime shells and declared MCP servers. Author names
+use `BUZZ_ACP_DISPLAY_NAME` (sanitized, with an npub fallback); email retains
+the public key and relay host. Inherited author/committer name and email
+overrides are cleared so native shells use the same agent attribution as MCP.
+Credential helpers are scoped to the selected
+relay's `/git` URLs. Existing `GIT_CONFIG_*` entries are preserved before the
+harness's overrides, and the complete block is forwarded in `mcpServers[].env`
+for agents that clear their MCP child environment.
+
+`buzz-acp` includes both Git helpers as multicall personalities, so standalone
+and remote launches need no separate signer installation. The harness creates
+private helper aliases and a 0600 keyfile, keeps them alive across adapter
+respawns, and removes them when it exits normally or completes graceful
+shutdown. As with other temporary files, SIGKILL or a machine crash cannot run
+cleanup. `BUZZ_PRIVATE_KEY` remains available to the Buzz CLI; adapters do not
+receive the redundant `NOSTR_PRIVATE_KEY` variable. No global Git config is
+modified. Standalone `buzz-dev-mcp` supplies utility aliases only; a non-Buzz
+ACP client must supply any desired Git environment itself.
+
+For research workers whose lifetime is owned by the operator's service manager,
+set `BUZZ_ACP_MAX_TURN_DURATION=0` and `BUZZ_ACP_IDLE_TIMEOUT=0` to let a turn run
+until completion or explicit cancellation. Zero disables that deadline; positive
+values retain the existing timeout behavior. An unlimited turn retains its queue
+ownership until completion, cancellation, or a reported process failure.
+
+### Restart-safe conversations
+
+`BUZZ_ACP_SESSION_STORE=/private/role/sessions` opts a supervised harness into
+private, atomic conversation checkpoints. Commission a separate directory for
+each identity. The checkpoint binds the relay, public identity, session policy,
+and pool slot; another process cannot own the same slot concurrently. The adapter
+must support ACP `session/load` and retain its own native-session references.
+
+An idle restart restores channel/thread and heartbeat sessions, delivered-event
+IDs, standing instructions, turn counters, and model override. Loading never
+submits a prompt. A missing native history or failed load is an error, with no
+new-session fallback. An interrupted turn or unreadable checkpoint requires
+operator reconciliation; the harness does not infer completion or replay work.
+Explicit idle resets retain their usual meaning. Automatic rotation during an
+uncertain turn is suppressed to retain the original conversation evidence.
+
+For an already running legacy harness, enabling this option alone cannot recover
+its in-memory mappings. Reconstruct and verify the exact identity/scope/session
+references and delivery state from retained local evidence before the first idle
+restart. If any reference is ambiguous, leave that service running until resolved.
+Keep reminder receipts, native histories, workspaces, and provider settings intact.
+
+### Private deployment drain for commissioned native adapters
+
+With `BUZZ_ACP_SESSION_STORE` configured, an operator can create a private
+`deployment/request` file in that store. Its contents are an opaque request
+token. New channel, heartbeat and reminder claims stop; accepted turns and native
+receipt recovery finish. The harness keeps receiving ordinary channel traffic
+into its queue while those turns finish. No model prompt or conversation control
+message is needed.
+
+Only after tasks settle and the queue is saved does the harness write
+`deployment/drain.json` with `state: drained`, its PID, identity and exact request
+contents. Verify PID and token before stopping the process, under the deployment
+owner's existing lock. Persistence failures leave the process and work running,
+with a `deployment drain blocked` diagnostic. Removing the request resumes claims.
+Preserve `deployment/backlog.json`, conversation checkpoints and reminder receipts
+when installing the next binary. Drain files stay below `deployment/` so
+existing conversation inspectors do not mistake them for conversation checkpoints. Queued event scopes and retry budgets survive;
+events already represented by pending or completed deliveries are not replayed.
+
+Use the existing one-start `--replay-floor` / `BUZZ_ACP_REPLAY_FLOOR` to cover relay
+arrivals during the restart window (capture the floor before requesting drain,
+with a clock-skew overlap). Startup suppresses IDs already represented by retained
+checkpoints or the restored backlog. Clear the one-start override after verifying
+startup; it is not a permanent invitation to replay historical traffic. Legacy
+binaries cannot acknowledge this drain: their first handoff requires explicit
+operator reconciliation, including queued relay traffic and any rotated sessions.
+
+An adapter advertising `_meta.axesRecovery.acceptBeforePreparation: true` promises
+to durably accept a request before preparatory work or native execution. The
+harness saves the exact prompt parameters with its pending attempt. After a lost
+transport it supplies `originalRequest` through `_axes/recover`, retaining the
+same attempt and conversation. Adapters without this capability retain the
+existing receipt-only recovery behavior. Unknown legacy holds are never silently
+converted to new prompts.
