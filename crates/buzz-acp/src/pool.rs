@@ -19,6 +19,9 @@
 //!
 //! `AcpClient` is NOT Clone — ownership moves out on claim and back on return.
 
+#[path = "pool_recovery_ownership.rs"]
+mod recovery_ownership;
+
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -110,7 +113,7 @@ pub struct AgentModelCapabilities {
 }
 
 /// Successful deliveries associated with one live channel session.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct ChannelDeliveryState {
     /// Whether a legacy user message has successfully carried standing context.
     pub standing_context_sent: bool,
@@ -120,20 +123,34 @@ pub struct ChannelDeliveryState {
     /// Canonical thread roots that have completed a successful context fetch in
     /// this ACP session. Hydrated threads use bounded overfetch so exact event-ID
     /// deduplication does not unnecessarily shrink the new-context window.
+    #[serde(default)]
     pub hydrated_thread_roots: VecDeque<String>,
+}
+
+/// The native conversation retained for one exact reminder occurrence.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct ReminderSession {
+    pub session: String,
+    pub standing_context_sent: bool,
 }
 
 /// Per-channel session IDs, turn counters, and delivery state.
 ///
 /// Separated from `OwnedAgent` so the state machine is testable without
 /// spawning a real agent subprocess.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionState {
     /// session scope → session_id
+    #[serde(with = "crate::session_store::scope_map")]
     pub sessions: HashMap<SessionScope, String>,
     pub heartbeat_session: Option<String>,
+    #[serde(default)]
+    pub(crate) reminder_sessions: HashMap<String, ReminderSession>,
+    #[serde(default)]
+    pub(crate) reminder_workspace_session: Option<String>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
+    #[serde(with = "crate::session_store::scope_map")]
     pub turn_counts: HashMap<SessionScope, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
@@ -141,6 +158,7 @@ pub struct SessionState {
     pub heartbeat_standing_context_sent: bool,
     /// session scope → rendered NIP-AE core prompt section, populated once at
     /// session creation per Tyler's spec (no mid-session refresh).
+    #[serde(with = "crate::session_store::scope_map")]
     pub core_sections: HashMap<SessionScope, String>,
     /// session scope → rendered `<channel-canvas>` metadata section.
     ///
@@ -148,24 +166,47 @@ pub struct SessionState {
     /// Absent when the channel has no canvas, the canvas content is blank, or the
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
+    #[serde(with = "crate::session_store::scope_map")]
     pub canvas_sections: HashMap<SessionScope, String>,
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
+    #[serde(with = "crate::session_store::scope_map")]
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
     /// Pool-assigned ownership generation for each scope. A worker returning
     /// after another worker forked the scope carries an older generation; the
     /// pool uses this fence to discard that stale provider session before the
     /// worker becomes claimable again.
+    #[serde(default, with = "crate::session_store::scope_map")]
     scope_owner_generations: HashMap<SessionScope, u64>,
+    #[serde(skip)]
+    pub(crate) store: Option<Arc<crate::session_store::Store>>,
+    #[serde(skip)]
+    pub(crate) pending_loads: HashSet<String>,
+    #[serde(skip)]
+    pub(crate) store_error: Option<String>,
+    #[serde(default)]
+    pub(crate) turn_active: bool,
+    #[serde(default)]
+    pub(crate) pending_turn: Option<crate::turn_recovery::Pending>,
+    #[serde(default)]
+    pub(crate) recovered_reminders: Vec<(String, String)>,
+    #[serde(default)]
+    pub(crate) recovery_held: bool,
+    #[serde(default)]
+    pub(crate) model_override: Option<String>,
 }
 
 impl SessionState {
     pub(crate) fn set_scope_owner_generation(&mut self, scope: SessionScope, generation: u64) {
         self.scope_owner_generations.insert(scope, generation);
+        self.persist_invalidation();
     }
 
     /// Invalidate the session (and turn counter) for a specific prompt source.
     pub fn invalidate(&mut self, source: &PromptSource) {
+        if self.store.is_some() && (self.turn_active || self.pending_turn.is_some()) {
+            return;
+        }
         match source {
             PromptSource::Channel(scope) => {
                 self.invalidate_scope(scope);
@@ -174,19 +215,26 @@ impl SessionState {
                 self.heartbeat_session = None;
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
+                self.persist_invalidation();
             }
+            PromptSource::Reminder => {}
         }
     }
 
     /// Invalidate a single session scope's session and turn counter.
     /// Returns `true` if the scope had an active session.
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
+        if self.store.is_some() && (self.turn_active || self.pending_turn.is_some()) {
+            return false;
+        }
         self.turn_counts.remove(scope);
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.scope_owner_generations.remove(scope);
-        self.sessions.remove(scope).is_some()
+        let removed = self.sessions.remove(scope).is_some();
+        self.persist_invalidation();
+        removed
     }
 
     /// Invalidate every session scope belonging to `channel_id` (channel-wide
@@ -217,9 +265,19 @@ impl SessionState {
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
+        if self.store.is_some() {
+            self.pending_loads = self.sessions.values().cloned().collect();
+            self.pending_loads
+                .extend(self.heartbeat_session.iter().cloned());
+            self.pending_loads
+                .extend(self.reminder_sessions.values().map(|s| s.session.clone()));
+            return;
+        }
         self.sessions.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
+        self.reminder_sessions.clear();
+        self.reminder_workspace_session = None;
         self.heartbeat_turn_count = 0;
         self.heartbeat_standing_context_sent = false;
         self.core_sections.clear();
@@ -362,6 +420,7 @@ impl OwnedAgent {
 /// (running inside a spawned task). The `task_map` tracks in-flight
 /// tasks for panic recovery.
 pub struct AgentPool {
+    pub(crate) deployment_drain: crate::deployment_drain::Drain,
     agents: Vec<Option<OwnedAgent>>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
@@ -378,6 +437,7 @@ pub struct AgentPool {
     /// generation distinguishes a newly forked owner from every older copy of
     /// that scope's provider session.
     next_scope_owner_generation: u64,
+    reminder_owners: HashMap<String, usize>,
     /// First time each scope was held for a busy owner, so the bounded hold can
     /// expire and fork rather than starve behind an unbounded turn. Derived
     /// state: cleared on every dispatch/invalidation path, and only ever holds
@@ -409,10 +469,22 @@ pub struct PromptResult {
 /// (conversation or thread), not just the channel id, so completion and
 /// invalidation target the exact session. Use [`channel_id`](PromptSource::channel_id)
 /// where only the channel is needed.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PromptSource {
     Channel(SessionScope),
     Heartbeat,
+    /// A due, author-owned NIP-ER reminder.
+    Reminder,
+}
+
+/// A private prompt that does not publish channel activity.
+pub struct PrivatePrompt {
+    /// Context delivered to the native agent.
+    pub text: String,
+    /// Whether this is a heartbeat or a due reminder.
+    pub source: PromptSource,
+    /// Exact reminder occurrence, retained until its native turn is acknowledged.
+    pub reminder: Option<(String, String)>,
 }
 
 impl PromptSource {
@@ -420,7 +492,7 @@ impl PromptSource {
     pub fn channel_id(&self) -> Option<Uuid> {
         match self {
             Self::Channel(scope) => Some(scope.channel_id()),
-            Self::Heartbeat => None,
+            Self::Heartbeat | Self::Reminder => None,
         }
     }
 
@@ -433,7 +505,7 @@ impl PromptSource {
     pub fn scope(&self) -> Option<&SessionScope> {
         match self {
             Self::Channel(scope) => Some(scope),
-            Self::Heartbeat => None,
+            Self::Heartbeat | Self::Reminder => None,
         }
     }
 }
@@ -948,16 +1020,32 @@ impl AgentPool {
     /// the index invariant.
     pub fn from_slots(slots: Vec<Option<OwnedAgent>>) -> Self {
         let (result_tx, result_rx) = mpsc::unbounded_channel();
-        Self {
+        let reminder_owners = slots
+            .iter()
+            .flatten()
+            .flat_map(|agent| {
+                agent
+                    .state
+                    .reminder_sessions
+                    .keys()
+                    .cloned()
+                    .map(|event| (event, agent.index))
+            })
+            .collect();
+        let mut pool = Self {
             agents: slots,
+            deployment_drain: crate::deployment_drain::Drain::from_env(),
             result_tx,
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
             session_owners: HashMap::new(),
             next_scope_owner_generation: 1,
+            reminder_owners,
             held_since: HashMap::new(),
-        }
+        };
+        pool.restore_initial_ownership();
+        pool
     }
 
     /// Record `agent_index` as the newest owner of `scope`, returning the
@@ -1059,11 +1147,19 @@ impl AgentPool {
     ///
     /// Returns `None` if all agents are checked out.
     pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
+        if self.deployment_drain.requested() {
+            return None;
+        }
+        self.restore_reminder_owners();
         // Pass 1: prefer agent with existing session for this scope.
         if let Some(scope) = scope {
             let idx = self.agents.iter().position(|slot| {
                 slot.as_ref()
-                    .map(|a| self.agent_owns_scope(a, scope))
+                    .map(|a| {
+                        self.agent_owns_scope(a, scope)
+                            && a.state.pending_turn.is_none()
+                            && a.state.store_error.is_none()
+                    })
                     .unwrap_or(false)
             });
             if let Some(i) = idx {
@@ -1072,8 +1168,46 @@ impl AgentPool {
         }
 
         // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
+        let idx = self.agents.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|a| a.state.pending_turn.is_none() && a.state.store_error.is_none())
+        });
         idx.map(|i| self.agents[i].take().unwrap())
+    }
+
+    /// Keep retries on their original worker, including while that worker is busy.
+    pub(crate) fn try_claim_reminder(&mut self, event: &str) -> Option<OwnedAgent> {
+        if self.deployment_drain.requested() {
+            return None;
+        }
+        self.restore_reminder_owners();
+        if let Some(&index) = self.reminder_owners.get(event) {
+            let slot = self.agents.get_mut(index)?;
+            let agent = slot.as_ref()?;
+            if agent.state.pending_turn.is_some() || agent.state.store_error.is_some() {
+                return None;
+            }
+            return slot.take();
+        }
+        if (0..self.agents.len()).any(|index| !self.slot_alive(index)) {
+            return None;
+        }
+        let agent = self.try_claim(None)?;
+        self.reminder_owners.insert(event.to_owned(), agent.index);
+        Some(agent)
+    }
+
+    fn restore_reminder_owners(&mut self) {
+        for agent in self.agents.iter().flatten() {
+            self.reminder_owners.extend(
+                agent
+                    .state
+                    .reminder_sessions
+                    .keys()
+                    .cloned()
+                    .map(|event| (event, agent.index)),
+            );
+        }
     }
 
     /// Return an agent to its slot after a task completes.
@@ -1098,7 +1232,20 @@ impl AgentPool {
             .state
             .scope_owner_generations
             .retain(|scope, _| live_scopes.contains(scope));
+        agent.state.model_override = agent
+            .model_overridden
+            .then(|| agent.desired_model.clone())
+            .flatten();
+        agent.state.persist_invalidation();
         let idx = agent.index;
+        self.reminder_owners.extend(
+            agent
+                .state
+                .reminder_sessions
+                .keys()
+                .cloned()
+                .map(|event| (event, idx)),
+        );
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -1110,6 +1257,70 @@ impl AgentPool {
             );
         }
         self.agents[idx] = Some(agent);
+    }
+
+    pub(crate) fn dispatch_recoveries(&mut self, ctx: &Arc<PromptContext>) {
+        self.restore_reminder_owners();
+        for index in 0..self.agents.len() {
+            let ready = self.agents[index].as_ref().is_some_and(|agent| {
+                agent.state.pending_turn.is_some()
+                    && !agent.state.recovery_held
+                    && agent.state.store_error.is_none()
+            });
+            if !ready {
+                continue;
+            }
+            let Some(agent) = self.agents[index].take() else {
+                continue;
+            };
+            let Some(pending) = agent.state.pending_turn.clone() else {
+                continue;
+            };
+            let handle = self.join_set.spawn(crate::turn_recovery::run(
+                agent,
+                Arc::clone(ctx),
+                self.result_tx.clone(),
+            ));
+            self.task_map.insert(
+                handle.id(),
+                TaskMeta {
+                    agent_index: index,
+                    channel_id: None,
+                    scope: None,
+                    turn_id: pending.attempt,
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+        }
+    }
+
+    pub(crate) fn flush_recovered_reminders(
+        &mut self,
+        reminders: &mut crate::reminders::Reminders,
+    ) {
+        for agent in self.agents.iter_mut().flatten() {
+            if agent.state.recovered_reminders.is_empty() {
+                continue;
+            }
+            let result = agent
+                .state
+                .recovered_reminders
+                .iter()
+                .try_for_each(|(id, event)| reminders.recovered(id, event));
+            match result {
+                Ok(()) => {
+                    agent.state.recovered_reminders.clear();
+                    agent.state.persist_invalidation();
+                }
+                Err(error) => {
+                    agent.state.store_error = Some(error.to_string());
+                    tracing::error!(%error, "recovered reminder receipt unavailable; holding agent");
+                }
+            }
+        }
     }
 
     /// Whether any agent is currently idle (sitting in its slot).
@@ -1145,7 +1356,12 @@ impl AgentPool {
 
     fn agent_owns_scope(&self, agent: &OwnedAgent, scope: &SessionScope) -> bool {
         let Some(owner) = self.session_owners.get(scope) else {
-            return false;
+            // Pre-fence durable checkpoints can contain multiple sessions for
+            // one scope. Keep their original first-idle affinity until dispatch
+            // establishes an upstream generation; do not guess an owner here.
+            return agent.state.store.is_some()
+                && !agent.state.scope_owner_generations.contains_key(scope)
+                && agent.state.sessions.contains_key(scope);
         };
         owner.agent_index == agent.index
             && agent.state.scope_owner_generations.get(scope) == Some(&owner.generation)
@@ -1449,6 +1665,7 @@ impl AgentPool {
 
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
+        agent.state.model_override = agent.desired_model.clone();
         // Carry the pick's correlator so a deferred-validation miss on the next
         // turn's session creation emits a late frame the Desktop can match.
         agent.desired_model_request_id = request_id;
@@ -2386,10 +2603,40 @@ fn send_prompt_result(
     turn_id: &str,
     mut agent: OwnedAgent,
     source: PromptSource,
-    outcome: PromptOutcome,
-    batch: Option<FlushBatch>,
+    mut outcome: PromptOutcome,
+    mut batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    if agent.state.pending_turn.is_some() {
+        match &outcome {
+            PromptOutcome::Ok(StopReason::EndTurn) => {
+                if let Err(error) = agent.state.complete_recovery(true) {
+                    agent.state.store_error = Some(error.to_string());
+                    outcome = PromptOutcome::Error(AcpError::Protocol(error.to_string()));
+                }
+            }
+            PromptOutcome::Ok(StopReason::Cancelled) => {
+                if let Err(error) = agent.state.complete_recovery(false) {
+                    agent.state.store_error = Some(error.to_string());
+                    outcome = PromptOutcome::Error(AcpError::Protocol(error.to_string()));
+                }
+            }
+            _ => {
+                batch = None;
+            }
+        }
+    }
+    if matches!(outcome, PromptOutcome::Ok(_) | PromptOutcome::Cancelled) {
+        agent.state.turn_active = agent.state.pending_turn.is_some();
+    }
+    agent.state.model_override = agent
+        .model_overridden
+        .then(|| agent.desired_model.clone())
+        .flatten();
+    if let Err(error) = agent.state.checkpoint() {
+        agent.state.store_error = Some(error.to_string());
+        outcome = PromptOutcome::Error(AcpError::Protocol(error.to_string()));
+    }
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -2415,7 +2662,7 @@ fn send_prompt_result(
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
-    prompt_text: Option<String>,
+    private_prompt: Option<PrivatePrompt>,
     ctx: Arc<PromptContext>,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
@@ -2425,8 +2672,29 @@ pub async fn run_prompt_task(
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
         Some(b) => PromptSource::Channel(b.scope.clone()),
-        None => PromptSource::Heartbeat,
+        None => private_prompt
+            .as_ref()
+            .map(|prompt| prompt.source.clone())
+            .unwrap_or(PromptSource::Heartbeat),
     };
+    if agent.state.store.is_some() && (agent.state.turn_active || agent.state.store_error.is_some())
+    {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(AcpError::Protocol(
+                "conversation requires reconciliation before more work".into(),
+            )),
+            None,
+        );
+        return;
+    }
+    let recovery_reminder = private_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.reminder.clone());
+    let prompt_text = private_prompt.map(|prompt| prompt.text);
     let observer_channel_id = source.channel_id();
     // Thread conversation context requires the canonical root to distinguish
     // concurrent threads in the same channel's activity.
@@ -2446,6 +2714,7 @@ pub async fn run_prompt_task(
         "source": match &source {
             PromptSource::Channel(_) => "channel",
             PromptSource::Heartbeat => "heartbeat",
+            PromptSource::Reminder => "reminder",
         },
         "triggeringEventIds": triggering_event_ids,
     });
@@ -2528,7 +2797,7 @@ pub async fn run_prompt_task(
                 return;
             }
         },
-        PromptSource::Heartbeat => None,
+        PromptSource::Heartbeat | PromptSource::Reminder => None,
     };
     // Whether this turn's prompt renders the channel as a DM. `format_prompt`
     // derives the same value from `resolved_channel_info`, which is fixed
@@ -2660,7 +2929,7 @@ pub async fn run_prompt_task(
     // Channel-scoped; heartbeats carry no owner core.
     let agent_core: Option<String> = match &source {
         PromptSource::Channel(scope) => agent.state.core_sections.get(scope).cloned(),
-        PromptSource::Heartbeat => None,
+        PromptSource::Heartbeat | PromptSource::Reminder => None,
     };
 
     // The canvas metadata section — channel-scoped, absent for heartbeats/DMs.
@@ -2672,7 +2941,7 @@ pub async fn run_prompt_task(
             .get(scope)
             .cloned()
             .or_else(|| pending_canvas.as_ref().map(|(_, s)| s.clone())),
-        PromptSource::Heartbeat => None,
+        PromptSource::Heartbeat | PromptSource::Reminder => None,
     };
 
     let (session_id, is_new_session) = match &source {
@@ -2746,6 +3015,82 @@ pub async fn run_prompt_task(
                 }
             }
         }
+        PromptSource::Reminder => {
+            let Some((_, event)) = recovery_reminder.as_ref() else {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(AcpError::Protocol(
+                        "reminder occurrence is missing".into(),
+                    )),
+                    None,
+                );
+                return;
+            };
+            if let Some(saved) = agent.state.reminder_sessions.get(event) {
+                (saved.session.clone(), false)
+            } else {
+                let workspace = agent
+                    .state
+                    .reminder_workspace_session
+                    .clone()
+                    .or_else(|| agent.state.heartbeat_session.clone());
+                agent.acp.reuse_workspace(workspace.clone());
+                match create_session_and_apply_model(
+                    &mut agent,
+                    &ctx,
+                    None,
+                    NewSessionChannelContext {
+                        huddle_instructions: None,
+                        canvas: None,
+                        name: None,
+                        scope: None,
+                        channel_type: None,
+                    },
+                )
+                .await
+                {
+                    Ok(sid) => {
+                        agent.state.reminder_workspace_session =
+                            Some(workspace.unwrap_or_else(|| sid.clone()));
+                        agent.state.reminder_sessions.insert(
+                            event.clone(),
+                            ReminderSession {
+                                session: sid.clone(),
+                                standing_context_sent: false,
+                            },
+                        );
+                        agent.acp.notify_session_spawned(&sid);
+                        (sid, true)
+                    }
+                    Err(AcpError::AgentExited) => {
+                        agent.state.invalidate_all();
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::AgentExited,
+                            None,
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(error),
+                            None,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
         PromptSource::Heartbeat => {
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
@@ -2802,6 +3147,43 @@ pub async fn run_prompt_task(
             }
         }
     };
+    if agent.state.pending_loads.contains(&session_id) {
+        match agent
+            .acp
+            .session_load(&session_id, &ctx.cwd, ctx.mcp_servers.clone())
+            .await
+        {
+            Ok(_) => {
+                agent.state.pending_loads.remove(&session_id);
+            }
+            Err(error) => {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    None,
+                );
+                return;
+            }
+        }
+    }
+    if agent.state.store.is_some() && !agent.acp.recovery_supported() {
+        agent.state.turn_active = true;
+        if let Err(error) = agent.state.checkpoint() {
+            agent.state.store_error = Some(error.to_string());
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Error(AcpError::Protocol(error.to_string())),
+                None,
+            );
+            return;
+        }
+    }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),
@@ -2843,6 +3225,10 @@ pub async fn run_prompt_task(
             .deliveries
             .get(scope)
             .is_some_and(|delivery| delivery.standing_context_sent),
+        PromptSource::Reminder => recovery_reminder
+            .as_ref()
+            .and_then(|(_, event)| agent.state.reminder_sessions.get(event))
+            .is_some_and(|saved| saved.standing_context_sent),
         PromptSource::Heartbeat => agent.state.heartbeat_standing_context_sent,
     };
 
@@ -2864,6 +3250,27 @@ pub async fn run_prompt_task(
                 &standing,
                 initial_msg,
             );
+            let pending = crate::turn_recovery::Pending {
+                attempt: format!("{turn_id}:initial"),
+                session: session_id.clone(),
+                source: source.clone(),
+                delivered: Vec::new(),
+                hydrated_thread_roots: Vec::new(),
+                standing: !agent.has_system_prompt_support(),
+                reminder: None,
+                request: None,
+            };
+            if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &[&init_msg]) {
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(error),
+                    None,
+                );
+                return;
+            }
             let init_result = agent
                 .acp
                 .session_prompt_with_idle_timeout(
@@ -2876,6 +3283,23 @@ pub async fn run_prompt_task(
 
             match init_result {
                 Ok(stop_reason) => {
+                    if agent.state.pending_turn.is_some() {
+                        if let Err(error) = agent
+                            .state
+                            .complete_recovery(matches!(stop_reason, StopReason::EndTurn))
+                        {
+                            agent.state.store_error = Some(error.to_string());
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(AcpError::Protocol(error.to_string())),
+                                None,
+                            );
+                            return;
+                        }
+                    }
                     tracing::info!(
                         target: "pool::session",
                         "initial_message complete for channel {cid}: {stop_reason:?}"
@@ -3183,7 +3607,7 @@ pub async fn run_prompt_task(
     let prompt_bytes: usize = prompt_blocks.iter().map(|block| block.len()).sum();
     let has_standing_context = match &source {
         PromptSource::Channel(_) => !standing.sections().is_empty(),
-        PromptSource::Heartbeat => ctx.base_prompt.is_some(),
+        PromptSource::Heartbeat | PromptSource::Reminder => ctx.base_prompt.is_some(),
     };
     let standing_context_included =
         !agent.has_system_prompt_support() && !standing_context_sent && has_standing_context;
@@ -3219,6 +3643,27 @@ pub async fn run_prompt_task(
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
     // (control_rx=None) take the simple await path — they are not controllable.
     //
+    let pending = crate::turn_recovery::Pending {
+        attempt: turn_id.clone(),
+        session: session_id.clone(),
+        source: source.clone(),
+        delivered: pending_delivered_event_ids.iter().cloned().collect(),
+        hydrated_thread_roots: pending_hydrated_thread_roots.iter().cloned().collect(),
+        standing: !agent.has_system_prompt_support(),
+        reminder: recovery_reminder.clone(),
+        request: None,
+    };
+    if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &prompt_blocks) {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Error(error),
+            None,
+        );
+        return;
+    }
     let prompt_result = match control_rx {
         None => {
             // Heartbeat / non-cancellable path.
@@ -3267,6 +3712,7 @@ pub async fn run_prompt_task(
                             .await
                         {
                             Ok(stop_reason) => {
+                                agent.state.turn_active = false;
                                 log_stop_reason(&source, &stop_reason);
                                 agent.state.invalidate(&source);
                                 let retry_batch =
@@ -3358,6 +3804,7 @@ pub async fn run_prompt_task(
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
+                        agent.state.turn_active = false;
                         log_stop_reason(&source, &StopReason::EndTurn);
                         if let PromptSource::Channel(scope) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
@@ -3401,6 +3848,7 @@ pub async fn run_prompt_task(
 
     match prompt_result {
         Ok(stop_reason) => {
+            agent.state.turn_active = false;
             log_stop_reason(&source, &stop_reason);
 
             if let PromptSource::Channel(scope) = &source {
@@ -3412,6 +3860,13 @@ pub async fn run_prompt_task(
                     &pending_delivered_event_ids,
                     &pending_hydrated_thread_roots,
                 );
+            } else if matches!(source, PromptSource::Reminder) {
+                if let Some(saved) = recovery_reminder
+                    .as_ref()
+                    .and_then(|(_, event)| agent.state.reminder_sessions.get_mut(event))
+                {
+                    saved.standing_context_sent = true;
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -3430,6 +3885,7 @@ pub async fn run_prompt_task(
                             *count += 1;
                             *count >= limit
                         }
+                        PromptSource::Reminder => false,
                         PromptSource::Heartbeat => {
                             agent.state.heartbeat_turn_count += 1;
                             agent.state.heartbeat_turn_count >= limit
@@ -4997,6 +5453,7 @@ fn prompt_label(source: &PromptSource) -> String {
             scope.telemetry_label()
         ),
         PromptSource::Heartbeat => "heartbeat".to_string(),
+        PromptSource::Reminder => "reminder".to_string(),
     }
 }
 
@@ -5681,6 +6138,10 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 }
 
 #[cfg(test)]
+#[path = "turn_recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
@@ -5829,6 +6290,7 @@ pub(crate) mod tests {
     }
 
     include!("pool/system_prompt_tests.rs");
+    include!("pool/recovery_ownership_tests.rs");
 
     #[test]
     fn test_initial_message_legacy_agent_without_base_is_unchanged() {
@@ -7198,6 +7660,272 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn reminders_start_fresh_reuse_workspace_and_restore_the_same_occurrence() {
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../../../contracts/axes-workspace-reuse.json"))
+                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let capture = directory.path().join("wire.jsonl");
+        let script = r#"import json,sys
+count=0
+for line in sys.stdin:
+    with open(sys.argv[1], 'a') as f:f.write(line)
+    r=json.loads(line)
+    method=r['method']
+    if method=='initialize':
+        result={'protocolVersion':1,'agentCapabilities':{},'_meta':{'axesWorkspaceReuse':{'version':1}}}
+    elif method=='session/new':
+        count+=1
+        result={'sessionId':'reminder-'+str(count)}
+    else:result={'stopReason':'end_turn'}
+    if 'id' in r:print(json.dumps({'id':r['id'],'result':result}),flush=True)
+"#;
+        let mut acp = AcpClient::spawn(
+            "python3",
+            &[
+                "-u".into(),
+                "-c".into(),
+                script.into(),
+                capture.display().to_string(),
+            ],
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        let initialized = acp.initialize().await.unwrap();
+        assert_eq!(initialized["_meta"], contract["capability"]);
+        let store = directory.path().join("state");
+        let mut state = SessionState::open(&store, 0, "identity").unwrap();
+        state.heartbeat_session = Some("existing-workspace-owner".into());
+        state.heartbeat_standing_context_sent = true;
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "axes-native-research".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        let mut context = make_prompt_context_no_owner();
+        context.base_prompt = Some("normal native capabilities".into());
+        context.max_turns_per_session = 1;
+        let context = Arc::new(context);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for (number, event) in ["first", "first", "snoozed", "first"].iter().enumerate() {
+            if number == 3 {
+                agent.state.checkpoint().unwrap();
+                drop(agent.state);
+                agent.state = SessionState::open(&store, 0, "identity").unwrap();
+            }
+            run_prompt_task(
+                agent,
+                None,
+                Some(PrivatePrompt {
+                    text: format!("Reminder {event}: inspect its original thread"),
+                    source: PromptSource::Reminder,
+                    reminder: Some(("same-reminder-id".into(), event.to_string())),
+                }),
+                Arc::clone(&context),
+                tx.clone(),
+                None,
+                format!("turn-{number}"),
+                Default::default(),
+            )
+            .await;
+            let result = rx.recv().await.unwrap();
+            assert!(matches!(
+                result.outcome,
+                PromptOutcome::Ok(StopReason::EndTurn)
+            ));
+            agent = result.agent;
+        }
+        let wire: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let creations: Vec<_> = wire
+            .iter()
+            .filter(|r| r["method"] == "session/new")
+            .collect();
+        assert_eq!(creations.len(), 2);
+        for request in creations {
+            let mut expected = contract["metadata"].clone();
+            expected["axesWorkspaceReuse"]["sessionId"] = "existing-workspace-owner".into();
+            assert_eq!(request["params"]["_meta"], expected);
+        }
+        let prompts: Vec<_> = wire
+            .iter()
+            .filter(|r| r["method"] == "session/prompt")
+            .collect();
+        assert_eq!(
+            prompts
+                .iter()
+                .map(|r| r["params"]["sessionId"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["reminder-1", "reminder-1", "reminder-2", "reminder-1"]
+        );
+        for (index, prompt) in prompts.iter().enumerate() {
+            assert_eq!(
+                prompt["params"]["prompt"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("normal native capabilities"),
+                index == 0 || index == 2
+            );
+        }
+        assert_eq!(
+            wire.iter()
+                .filter(|r| r["method"] == "session/load")
+                .count(),
+            1
+        );
+        assert_eq!(
+            agent.state.heartbeat_session.as_deref(),
+            Some("existing-workspace-owner")
+        );
+        agent.acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reminder_retry_waits_for_its_busy_or_held_owner() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let mut first = idle_agent_with_session(0, scope.clone()).await;
+        let mut second = idle_agent_with_session(1, scope).await;
+        first.index = 0;
+        second.index = 1;
+        second.state.reminder_sessions.insert(
+            "occurrence".into(),
+            ReminderSession {
+                session: "retained-native".into(),
+                standing_context_sent: true,
+            },
+        );
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        let mut owner = pool.try_claim_reminder("occurrence").unwrap();
+        assert_eq!(owner.index, 1);
+        assert!(pool.try_claim_reminder("occurrence").is_none());
+        owner.state.store_error = Some("retained work needs inspection".into());
+        pool.return_agent(owner);
+        assert!(pool.try_claim_reminder("occurrence").is_none());
+        pool.agents[1].as_mut().unwrap().state.store_error = None;
+        let owner = pool.try_claim_reminder("occurrence").unwrap();
+        assert_eq!(owner.index, 1);
+        pool.return_agent(owner);
+        for agent in pool.agents.iter_mut().flatten() {
+            agent.acp.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_loads_original_conversation_before_new_prompt_and_load_error_never_resets() {
+        for (reject_load, rotate) in [(false, false), (true, false), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let store_path = directory.path().join("sessions");
+            let capture = directory.path().join("wire.jsonl");
+            let mut state = SessionState::open(&store_path, 0, "identity").unwrap();
+            state.heartbeat_session = Some("same-native-conversation".into());
+            state.heartbeat_standing_context_sent = true;
+            state.checkpoint().unwrap();
+            drop(state);
+            let script = format!(
+                r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{}'
+  if [ "$count" -eq 0 ] && [ '{}' = true ]; then
+    printf '%s\n' '{{"id":0,"error":{{"code":-32000,"message":"history unavailable"}}}}'
+  else
+    printf '%s\n' "{{\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  fi
+  count=$((count + 1))
+done"#,
+                capture.display(),
+                reject_load
+            );
+            let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+                .await
+                .unwrap();
+            let agent = OwnedAgent {
+                index: 0,
+                acp,
+                state: SessionState::open(&store_path, 0, "identity").unwrap(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                desired_model_request_id: None,
+                desired_model_pending_ack: false,
+                startup_effort: None,
+                agent_name: "legacy-test-agent".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            };
+            let mut ctx = make_prompt_context_no_owner();
+            ctx.base_prompt = Some("must not resend standing instructions".into());
+            ctx.max_turns_per_session = u32::from(rotate);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            run_prompt_task(
+                agent,
+                None,
+                Some(PrivatePrompt {
+                    text: "only the new follow-up".into(),
+                    source: PromptSource::Heartbeat,
+                    reminder: None,
+                }),
+                Arc::new(ctx),
+                tx,
+                None,
+                "restored-turn".into(),
+                Default::default(),
+            )
+            .await;
+            let mut result = rx.recv().await.unwrap();
+            result.agent.acp.shutdown().await;
+            let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(requests[0]["method"], "session/load");
+            assert_eq!(
+                requests[0]["params"]["sessionId"],
+                "same-native-conversation"
+            );
+            if reject_load {
+                assert_eq!(requests.len(), 1);
+                assert!(matches!(result.outcome, PromptOutcome::Error(_)));
+            } else {
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[1]["method"], "session/prompt");
+                assert_eq!(
+                    requests[1]["params"]["sessionId"],
+                    "same-native-conversation"
+                );
+                assert!(!requests[1].to_string().contains("must not resend"));
+                assert!(matches!(result.outcome, PromptOutcome::Ok(_)));
+            }
+            assert_eq!(
+                result.agent.state.heartbeat_session.as_deref(),
+                (!rotate).then_some("same-native-conversation")
+            );
+            drop(result);
+            let restored = SessionState::open(&store_path, 0, "identity").unwrap();
+            assert_eq!(
+                restored.heartbeat_session.as_deref(),
+                (!rotate).then_some("same-native-conversation")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn run_prompt_task_commits_standing_context_only_after_acp_success() {
         let capture = std::env::temp_dir().join(format!(
             "buzz-acp-standing-lifecycle-{}.ndjson",
@@ -7244,7 +7972,11 @@ done"#
             run_prompt_task(
                 agent,
                 None,
-                Some(format!("heartbeat-{turn}")),
+                Some(PrivatePrompt {
+                    text: format!("heartbeat-{turn}"),
+                    source: PromptSource::Heartbeat,
+                    reminder: None,
+                }),
                 Arc::clone(&ctx),
                 result_tx.clone(),
                 None,
@@ -11933,6 +12665,9 @@ done"#
         });
         let acp = spawn_switch_acp(OPTS_MODEL_A_AND_B, r#""result":{}"#).await;
         let mut agent = switching_agent(acp, "model-a");
+        let directory = tempfile::tempdir().unwrap();
+        agent.state =
+            SessionState::open(&directory.path().join("sessions"), 0, "idle-switch").unwrap();
         for scope in &scopes {
             agent
                 .state
@@ -11941,6 +12676,14 @@ done"#
         }
         let original_sessions = agent.state.sessions.clone();
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        assert_eq!(
+            pool.session_owners.get(&scopes[0]).map(|o| o.agent_index),
+            Some(0)
+        );
+        assert_eq!(
+            pool.session_owners.get(&scopes[1]).map(|o| o.agent_index),
+            Some(0)
+        );
         assert_eq!(
             pool.switch_idle_agent_model(channel_id, "model-b", Some("pick".into())),
             IdleSwitchResult::AmbiguousTarget,
@@ -11962,6 +12705,11 @@ done"#
         );
         let agent = pool.agents[0].as_ref().unwrap();
         assert_eq!(agent.desired_model.as_deref(), Some("model-b"));
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(directory.path().join("sessions/0.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["state"]["model_override"], "model-b");
         assert!(!agent.state.sessions.contains_key(&scopes[0]));
         assert!(!pool.session_owners.contains_key(&scopes[0]));
         assert!(

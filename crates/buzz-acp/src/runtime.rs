@@ -49,6 +49,7 @@ impl AgentRuntime {
 
 #[derive(Clone)]
 pub(crate) struct PoolStartup {
+    pub(crate) session_identity: String,
     pub(crate) agents: u32,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
@@ -62,6 +63,12 @@ pub(crate) struct PoolStartup {
 impl PoolStartup {
     fn from_config(config: &Config, observer: Option<observer::ObserverHandle>) -> Self {
         Self {
+            session_identity: format!(
+                "{}:{}:{}",
+                config.relay_url,
+                config.keys.public_key().to_hex(),
+                config.session_policy
+            ),
             agents: config.agents,
             command: config.agent_command.clone(),
             args: config.agent_args.clone(),

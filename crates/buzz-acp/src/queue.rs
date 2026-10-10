@@ -13,6 +13,9 @@
 //!   still queue normally.
 //! - **Queue** — all events accumulate; batched on the next flush cycle.
 
+mod deployment;
+pub(crate) use deployment::Snapshot;
+
 use nostr::{Event, ToBech32};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -97,7 +100,7 @@ const IN_FLIGHT_DEADLINE_BUFFER_SECS: u64 = 100;
 const DEFAULT_IN_FLIGHT_DEADLINE_SECS: u64 = 7300;
 
 /// An event waiting in the queue.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueuedEvent {
     pub channel_id: Uuid,
     /// Session scope resolved once at admission. Under `channel` policy this is
@@ -106,6 +109,7 @@ pub struct QueuedEvent {
     /// channel alone. Invariant: `scope.channel_id() == channel_id`.
     pub scope: SessionScope,
     pub event: Event,
+    #[serde(skip, default = "Instant::now")]
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
@@ -391,8 +395,11 @@ impl EventQueue {
     /// Set the in-flight backstop deadline from the configured max turn
     /// duration, preserving the 100s buffer for cancel-drain grace + respawn.
     pub fn with_in_flight_deadline(mut self, max_turn_duration_secs: u64) -> Self {
-        self.in_flight_deadline =
-            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
+        self.in_flight_deadline = if max_turn_duration_secs == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(max_turn_duration_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS)
+        };
         self
     }
 
@@ -405,6 +412,10 @@ impl EventQueue {
     /// a deadline.
     pub fn extend_in_flight_deadline<K: IntoScope>(&mut self, scope: K, max_turn_secs: u64) {
         let scope = scope.into_scope();
+        if max_turn_secs == 0 {
+            self.in_flight_deadlines.remove(&scope);
+            return;
+        }
         if let Some(current) = self.in_flight_deadlines.get_mut(&scope) {
             let extended = Instant::now()
                 + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
@@ -565,8 +576,10 @@ impl EventQueue {
                         let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
                         let cancel_reason = self.cancel_reasons.remove(&scope);
                         self.in_flight_scopes.insert(scope.clone());
-                        self.in_flight_deadlines
-                            .insert(scope.clone(), now + self.in_flight_deadline);
+                        if !self.in_flight_deadline.is_zero() {
+                            self.in_flight_deadlines
+                                .insert(scope.clone(), now + self.in_flight_deadline);
+                        }
                         self.in_flight_batch_sizes
                             .insert(scope.clone(), cancelled.len());
                         self.record_in_flight_reply_route(&scope, &cancelled);
@@ -603,8 +616,10 @@ impl EventQueue {
         }
 
         self.in_flight_scopes.insert(scope.clone());
-        self.in_flight_deadlines
-            .insert(scope.clone(), now + self.in_flight_deadline);
+        if !self.in_flight_deadline.is_zero() {
+            self.in_flight_deadlines
+                .insert(scope.clone(), now + self.in_flight_deadline);
+        }
         self.in_flight_batch_sizes
             .insert(scope.clone(), events.len());
         self.record_in_flight_reply_route(&scope, &events);
@@ -1298,7 +1313,7 @@ impl Default for EventQueue {
 }
 
 /// Parsed thread relationship from NIP-10 `e` tags.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadTags {
     /// Root event ID (hex). Present for all thread replies.
     pub root_event_id: Option<String>,
@@ -1309,7 +1324,7 @@ pub struct ThreadTags {
 }
 
 /// Original-message routing recovered for a kind:40003 edit event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedEdit {
     /// Id of the edited original message, taken from the edit's `e` tag and
     /// verified against the fetched original's id and signature.
@@ -2719,12 +2734,12 @@ mod tests {
 
     /// Conversation scope for a channel — the default scope the queue's own
     /// unit tests exercise (equivalent to the pre-thread-scoping channel key).
-    fn conv(channel_id: Uuid) -> SessionScope {
+    pub(super) fn conv(channel_id: Uuid) -> SessionScope {
         SessionScope::Conversation { channel_id }
     }
 
     /// Build a QueuedEvent for the given channel (conversation scope).
-    fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
+    pub(super) fn make_queued(channel_id: Uuid, content: &str) -> QueuedEvent {
         QueuedEvent {
             edit: None,
             channel_id,
@@ -2733,6 +2748,21 @@ mod tests {
             received_at: Instant::now(),
             prompt_tag: "test".into(),
         }
+    }
+
+    #[test]
+    fn unlimited_turn_keeps_queue_ownership_until_completion() {
+        let mut queue = EventQueue::new(DedupMode::Queue).with_in_flight_deadline(0);
+        let channel = Uuid::new_v4();
+        queue.push(make_queued(channel, "first task"));
+        assert!(queue.flush_next().is_some());
+        queue.push(make_queued(channel, "follow-up"));
+        queue.extend_in_flight_deadline(channel, 0);
+        assert!(queue.in_flight_deadlines.is_empty());
+        assert!(queue.flush_next().is_none());
+        queue.mark_complete(channel);
+        let batch = queue.flush_next().unwrap();
+        assert_eq!(batch.events[0].event.content, "follow-up");
     }
 
     /// Build a QueuedEvent with a specific `received_at` offset from now.

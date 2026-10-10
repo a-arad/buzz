@@ -1,0 +1,38 @@
+{
+  "capability": {
+    "version": 1,
+    "acceptBeforePreparation": true
+  },
+  "prompt": {
+    "sessionId": "retained-session",
+    "prompt": [
+      {
+        "type": "text",
+        "text": "original task"
+      }
+    ],
+    "_meta": {
+      "axesRecovery": {
+        "attempt": "same-attempt"
+      }
+    }
+  },
+  "recovery": {
+    "sessionId": "retained-session",
+    "attempt": "same-attempt",
+    "originalRequest": {
+      "sessionId": "retained-session",
+      "prompt": [
+        {
+          "type": "text",
+          "text": "original task"
+        }
+      ],
+      "_meta": {
+        "axesRecovery": {
+          "attempt": "same-attempt"
+        }
+      }
+    }
+  }
+}

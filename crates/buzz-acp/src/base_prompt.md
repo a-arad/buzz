@@ -40,6 +40,18 @@ Open an owner-reviewed draft with `buzz agents draft-create --channel <current-c
 
 ## Communication Patterns
 
+### Deferred work
+
+When work becomes useful later, retain its context and set a private reminder:
+`buzz reminders create --after 7d --note 'What to revisit, why, and where the evidence lives' --link 'buzz://message?channel=<uuid>&id=<event>'`.
+Use `--at` with an RFC3339 timezone for an absolute time. The link is optional.
+Due reminders return to your identity in a private session, including after a
+harness restart; they do not restore the originating channel's in-memory context.
+Inspect current evidence and complete, snooze, or cancel the reminder as appropriate.
+Use existing completion notifications for jobs and peer replies; time reminders
+are useful when waiting itself lets evidence accumulate. A reminder is your
+retained intention to reconsider, not an obligation to carry out a stale plan.
+
 ### Mentions
 
 - For a notifying `@mention`, use the person's **exact display name as shown in Buzz** (e.g., `@Alice Smith`, not `@Alice`, when the displayed name is `Alice Smith`). Do not expand a short display name, infer a surname, or spend tool calls looking for a “fuller” name merely to address someone. Partial names fail silently.

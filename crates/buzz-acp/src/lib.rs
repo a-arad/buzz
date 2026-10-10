@@ -6,6 +6,7 @@ mod git_runtime_tests;
 
 mod acp;
 mod config;
+mod deployment_drain;
 mod edit_routing;
 mod engram_fetch;
 mod filter;
@@ -21,8 +22,13 @@ mod relay;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
+mod recovery_wait;
+mod reminder_receipts;
+mod reminders;
 mod scope;
+mod session_store;
 mod setup_mode;
+mod turn_recovery;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -3037,6 +3043,11 @@ async fn run_harness(
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    let deployment_drain = deployment_drain::Drain::from_env();
+    let drain_identity = format!("{}:{}", config.relay_url, pubkey_hex);
+    deployment_drain.restore(&drain_identity, &mut queue)?;
+    let startup_deliveries = deployment_drain.startup_events(&queue)?;
+    let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
 
     // Online means the harness can receive work, not merely that its socket is
     // connected. Publishing after channel subscriptions gives desktop callers
@@ -3082,6 +3093,14 @@ async fn run_harness(
         None
     };
     let mut heartbeat_in_flight = false;
+    let mut reminders = match reminders::Reminders::open(&ctx.rest_client) {
+        Ok(state) => Some(state),
+        Err(error) => {
+            tracing::error!(%error, "reminder delivery disabled: cannot open durable receipts");
+            None
+        }
+    };
+    let (mut reminder_rx, reminder_poller) = reminders::start_polling(ctx.rest_client.clone());
 
     let mut presence_heartbeat = if config.presence_enabled {
         let interval = Duration::from_secs(60);
@@ -3229,14 +3248,50 @@ async fn run_harness(
     }
 
     loop {
+        if let Some(state) = reminders.as_mut() {
+            state.recover_missing_turn(pool.task_map().values().map(|meta| meta.turn_id.clone()));
+        }
+        if let Some(state) = reminders.as_mut() {
+            pool.flush_recovered_reminders(state);
+        }
+        pool.dispatch_recoveries(&ctx);
+        if let Err(error) = deployment_drain.retire_delivered(&drain_identity) {
+            tracing::error!(%error, "deployment backlog remains retained");
+        }
+        let idle = pool.task_map().is_empty()
+            && pool.join_set.is_empty()
+            && wake_tasks.is_empty()
+            && !any_respawn_in_flight(&crash_history);
+        if deployment_drain.poll(&drain_identity, &queue, idle) {
+            tracing::info!("deployment drain complete; waiting for operator");
+            let stopping = loop {
+                if !deployment_drain.requested() {
+                    break false;
+                }
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break true,
+                    _ = drain_tick.tick() => {}
+                }
+            };
+            if stopping {
+                break;
+            }
+        }
+        let next_reminder = match reminders.as_ref().map(|state| state.next()).transpose() {
+            Ok(candidate) => candidate.flatten(),
+            Err(error) => {
+                tracing::error!(%error, "cannot read reminder receipts; delivery deferred");
+                None
+            }
+        };
         // Whether buffered work is waiting on a lazy pool. Also gates the
         // retry-deadline sleep arm below: a `Failed` lifecycle keeps its
         // (possibly past) `retry_at` until the next wake, so sleeping on it
         // unconditionally would complete instantly on every iteration — a
         // busy spin — whenever the queued work drained after a failed wake.
         let mut lazy_wake_work_pending = false;
-        if config.lazy_pool && !pool_ready {
-            lazy_wake_work_pending = queue.has_flushable_work();
+        if config.lazy_pool && !pool_ready && !deployment_drain.requested() {
+            lazy_wake_work_pending = queue.has_flushable_work() || next_reminder.is_some();
             if let Some(attempt) = pool_lifecycle
                 .start_wake_if_due(lazy_wake_work_pending, tokio::time::Instant::now())
             {
@@ -3330,6 +3385,22 @@ async fn run_harness(
             None
         };
         let maintenance_at = pool_ready.then_some(last_maintenance + maintenance_interval);
+
+        if pool_ready && !queue.has_flushable_work() && !heartbeat_in_flight {
+            if let Some(reminder) = next_reminder {
+                if let Some(turn_id) = dispatch_private(
+                    &mut pool,
+                    &ctx,
+                    &mut heartbeat_in_flight,
+                    Some(reminder.clone()),
+                ) {
+                    if let Some(state) = reminders.as_mut() {
+                        state.started(turn_id, reminder);
+                    }
+                    last_activity = tokio::time::Instant::now();
+                }
+            }
+        }
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
@@ -3440,6 +3511,7 @@ async fn run_harness(
                     let _ = result_rx; // end split borrow before relay handling
                     match buzz_event {
                         Some(buzz_event) => {
+                            if startup_deliveries.contains(&buzz_event.event.id.to_hex()) { continue; }
                             let kind_u32 = buzz_event.event.kind.as_u16() as u32;
 
                             if kind_u32 == KIND_MEMBER_ADDED_NOTIFICATION
@@ -3766,7 +3838,8 @@ async fn run_harness(
                             // event data through the optional steer/interrupt
                             // decision.
                             queued.steer_or_interrupt(
-                                config.multiple_event_handling,
+                                if deployment_drain.requested() { MultipleEventHandling::Queue }
+                                else { config.multiple_event_handling },
                                 owner_cache.get(),
                                 &mut pool,
                                 &mut queue,
@@ -3862,6 +3935,10 @@ async fn run_harness(
                     }
                     None
                 }
+                Some(heads) = reminder_rx.recv() => {
+                    if let Some(state) = reminders.as_mut() { state.refresh(heads); }
+                    None
+                }
                 _ = async {
                     match heartbeat.as_mut() {
                         Some(hb) => hb.tick().await,
@@ -3929,6 +4006,7 @@ async fn run_harness(
                     }
                     None
                 }
+                _ = drain_tick.tick() => { None }
             }
         };
 
@@ -3938,14 +4016,35 @@ async fn run_harness(
                     recovery_wake::RecoveryWake::Respawn(rr) => {
                         crash_history[rr.index].respawn_in_flight = false;
                         match rr.result {
-                            Ok((acp, protocol_version, agent_name)) => {
+                            Ok((mut acp, protocol_version, agent_name)) => {
+                                let identity = format!(
+                                    "{}:{}:{}",
+                                    config.relay_url,
+                                    config.keys.public_key().to_hex(),
+                                    config.session_policy
+                                );
+                                let state = match SessionState::restore(rr.index, &identity) {
+                                    Ok(state) => state,
+                                    Err(error) => {
+                                        acp.shutdown().await;
+                                        crash_history[rr.index].mark_spawn_failed();
+                                        tracing::error!(
+                                            agent = rr.index,
+                                            "conversation restoration failed: {error}"
+                                        );
+                                        continue;
+                                    }
+                                };
                                 let agent = OwnedAgent {
                                     index: rr.index,
                                     acp,
-                                    state: SessionState::default(),
                                     model_capabilities: None,
-                                    desired_model: config.model.clone(),
-                                    model_overridden: false,
+                                    desired_model: state
+                                        .model_override
+                                        .clone()
+                                        .or_else(|| config.model.clone()),
+                                    model_overridden: state.model_override.is_some(),
+                                    state,
                                     desired_model_request_id: None,
                                     desired_model_pending_ack: false,
                                     startup_effort: config.effort_level.clone(),
@@ -3953,7 +4052,7 @@ async fn run_harness(
                                     goose_system_prompt_supported: None,
                                     protocol_version,
                                 };
-                                pool.return_agent(agent);
+                                pool.return_restored_agent(agent);
                                 tracing::info!(agent = rr.index, "respawn complete");
                             }
                             Err(e) => {
@@ -3980,6 +4079,9 @@ async fn run_harness(
                 }
             }
             Some(PoolEvent::Result(result)) => {
+                if let Some(state) = reminders.as_mut() {
+                    state.finished(&result.turn_id, &result.outcome);
+                }
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
                 // same channel must keep its indicator.
@@ -4372,6 +4474,7 @@ async fn run_harness(
     }
 
     // Cancel any in-flight presence heartbeat before sending offline.
+    reminder_poller.abort();
     if let Some(h) = presence_task.take() {
         h.abort();
     }
@@ -5405,7 +5508,7 @@ fn handle_prompt_result(
 
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
-        PromptSource::Heartbeat => *heartbeat_in_flight = false,
+        PromptSource::Heartbeat | PromptSource::Reminder => *heartbeat_in_flight = false,
     }
 
     // Strip sessions for channels the agent was removed from while this
@@ -5798,12 +5901,23 @@ fn dispatch_heartbeat(
     ctx: &Arc<PromptContext>,
     heartbeat_in_flight: &mut bool,
 ) {
-    if *heartbeat_in_flight {
-        return;
+    if dispatch_private(pool, ctx, heartbeat_in_flight, None).is_some() {
+        tracing::info!("heartbeat_fired");
     }
-    let agent = match pool.try_claim(None) {
-        Some(a) => a,
-        None => return,
+}
+
+fn dispatch_private(
+    pool: &mut AgentPool,
+    ctx: &Arc<PromptContext>,
+    heartbeat_in_flight: &mut bool,
+    reminder: Option<buzz_sdk::reminders::Reminder>,
+) -> Option<String> {
+    if *heartbeat_in_flight {
+        return None;
+    }
+    let agent = match reminder.as_ref() {
+        Some(reminder) => pool.try_claim_reminder(&reminder.event_id)?,
+        None => pool.try_claim(None)?,
     };
 
     let prompt_text = ctx
@@ -5817,10 +5931,18 @@ fn dispatch_heartbeat(
     let task_turn_id = turn_id.clone();
 
     let abort_handle = pool.join_set.spawn(async move {
+        if let Some(reminder) = reminder {
+            reminders::run(agent, reminder, ctx_clone, result_tx, task_turn_id).await;
+            return;
+        }
         pool::run_prompt_task(
             agent,
             None,
-            Some(prompt_text),
+            Some(pool::PrivatePrompt {
+                text: prompt_text,
+                source: PromptSource::Heartbeat,
+                reminder: None,
+            }),
             ctx_clone,
             result_tx,
             None,
@@ -5836,7 +5958,7 @@ fn dispatch_heartbeat(
             agent_index,
             channel_id: None,
             scope: None,
-            turn_id,
+            turn_id: turn_id.clone(),
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5844,7 +5966,7 @@ fn dispatch_heartbeat(
         },
     );
     *heartbeat_in_flight = true;
-    tracing::info!(agent = agent_index, "heartbeat_fired");
+    Some(turn_id)
 }
 
 #[cfg(test)]
@@ -6045,6 +6167,13 @@ async fn initialize_agent_pool(
     // Attempt each spawn under a 60-second timeout; a partial pool is valid.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
+        let state = match SessionState::restore(i, &startup.session_identity) {
+            Ok(state) => state,
+            Err(error) => {
+                shutdown_agent_slots(&mut agent_slots).await;
+                return Err(error);
+            }
+        };
         let spawn_result = AcpClient::spawn(
             &startup.command,
             &startup.args,
@@ -6095,10 +6224,13 @@ async fn initialize_agent_pool(
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
-                            state: SessionState::default(),
                             model_capabilities: None,
-                            desired_model: startup.model.clone(),
-                            model_overridden: false,
+                            desired_model: state
+                                .model_override
+                                .clone()
+                                .or_else(|| startup.model.clone()),
+                            model_overridden: state.model_override.is_some(),
+                            state,
                             desired_model_request_id: None,
                             desired_model_pending_ack: false,
                             startup_effort: startup.effort_level.clone(),
