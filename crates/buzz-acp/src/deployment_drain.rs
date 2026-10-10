@@ -36,6 +36,7 @@ impl Drain {
         let Some(root) = &self.root else {
             anyhow::bail!("drain requires a durable session store")
         };
+        #[cfg(unix)]
         let parent = root;
         let root = root.join("deployment");
         let mut builder = fs::DirBuilder::new();
