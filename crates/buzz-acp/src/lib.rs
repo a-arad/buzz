@@ -1,5 +1,7 @@
 #![deny(unsafe_code)]
 
+#[cfg(all(test, unix))]
+mod durable_startup_tests;
 mod git;
 #[cfg(all(test, unix))]
 mod git_runtime_tests;
@@ -6163,8 +6165,9 @@ async fn initialize_agent_pool(
     startup: &PoolStartup,
     mut shutdown: Option<watch::Receiver<()>>,
 ) -> Result<AgentPool> {
-    // One agent failing to start must not kill the whole pool.
-    // Attempt each spawn under a 60-second timeout; a partial pool is valid.
+    // Stateless pools may start partially. Durable pools need every worker's
+    // history before ownership reconstruction; validate that after initialization.
+    // Attempt each spawn under a 60-second timeout.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
         let state = match SessionState::restore(i, &startup.session_identity) {
@@ -6265,6 +6268,20 @@ async fn initialize_agent_pool(
         ));
     }
     if live_count < startup.agents as usize {
+        if agent_slots
+            .iter()
+            .flatten()
+            .any(|agent| agent.state.store.is_some())
+        {
+            // An absent durable worker may own a conversation or reminder.
+            // Reconstructing ownership from only the surviving slots can stamp
+            // another worker as newer before any native work has run.
+            shutdown_agent_slots(&mut agent_slots).await;
+            anyhow::bail!(
+                "started {}/{} durable agents; preserving checkpoints until the complete pool can start",
+                live_count, startup.agents
+            );
+        }
         tracing::warn!(
             "started {}/{} agents — continuing with reduced pool",
             live_count,
