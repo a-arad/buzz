@@ -1,0 +1,23 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: buzz-pairing
+  namespace: buzz
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.priority: '1000'
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [buzz-trial.axes.com]
+      secretName: buzz-trial-tls
+  rules:
+    - host: buzz-trial.axes.com
+      http:
+        paths:
+          - path: /pair
+            pathType: Exact
+            backend:
+              service:
+                name: buzz-pairing
+                port: {number: 5000}
