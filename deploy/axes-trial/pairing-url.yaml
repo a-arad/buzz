@@ -1,0 +1,5 @@
+# Candidate overlay for the EXISTING accepted Helm chart and retained values.
+# Externally managed dedicated pairing workload; preserve the main relay image.
+pairingRelay:
+  enabled: false
+  url: wss://buzz-trial.axes.com/pair

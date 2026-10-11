@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buzz-pairing
+  namespace: buzz
+  annotations:
+    axes.com/source-revision: 890c7febb05de56799b41e7acab46898ace097e1
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: buzz-pairing}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: buzz-pairing}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: pairing-relay
+          image: {{ required "image must identify the verified immutable pairing image" .Values.image | quote }}
+          command: [/usr/local/bin/buzz-pair-relay]
+          env:
+            - {name: BUZZ_PAIR_RELAY_BIND_ADDR, value: '0.0.0.0:5000'}
+          ports:
+            - {name: websocket, containerPort: 5000, protocol: TCP}
+          readinessProbe: {tcpSocket: {port: websocket}}
+          livenessProbe: {tcpSocket: {port: websocket}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 50m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buzz-pairing
+  namespace: buzz
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: buzz-pairing}
+  ports:
+    - {name: websocket, port: 5000, targetPort: websocket, protocol: TCP}

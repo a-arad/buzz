@@ -1,0 +1,6 @@
+apiVersion: v2
+name: buzz-pairing-site
+description: Dedicated stateless pairing endpoint for buzz-trial
+type: application
+version: 0.1.0
+appVersion: "890c7febb05de56799b41e7acab46898ace097e1"
