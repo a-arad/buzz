@@ -517,7 +517,7 @@ fn resolve_send_message_channel(
 /// `RequestApproval` returns `StepResult::Suspended` — the caller must
 /// persist state and stop the execution loop.
 pub async fn dispatch_action(
-    step_id: &str,
+    step: &Step,
     action: &ActionDef,
     engine: &WorkflowEngine,
     community_id: CommunityId,
@@ -525,6 +525,7 @@ pub async fn dispatch_action(
     trigger_ctx: &TriggerContext,
 ) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
+    let step_id = &step.id;
 
     match action {
         SendMessage { text, channel } => {
@@ -565,9 +566,23 @@ pub async fn dispatch_action(
                 "SendMessage → {channel_id}: {text}"
             );
 
+            let authored_text = match &step.action {
+                SendMessage { text, .. } => text.as_str(),
+                _ => {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "SendMessage: resolved action does not match its authored step".into(),
+                    ));
+                }
+            };
             let event_id = engine
                 .action_sink()?
-                .send_message(community_id, &channel_id, text, &owner_pubkey_hex)
+                .send_message(
+                    community_id,
+                    &channel_id,
+                    text,
+                    authored_text,
+                    &owner_pubkey_hex,
+                )
                 .await
                 .map_err(WorkflowError::from)?;
 
@@ -1139,7 +1154,7 @@ async fn execute_steps(
         let dispatch_result = tokio::time::timeout(
             std::time::Duration::from_secs(timeout_secs),
             dispatch_action(
-                &step.id,
+                step,
                 &resolved_action,
                 engine,
                 community_id,

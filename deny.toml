@@ -6,6 +6,12 @@ ignore = [
     # paste 1.0.15 — unmaintained. Transitive dep: mesh-llm → iroh → netlink-* → paste.
     # No safe upgrade available; tracked for upstream (iroh/netlink) replacement.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via mesh-llm → iroh → netlink; no upstream fix available" },
+    # Unmaintained notices only; no patched versions. These do not exempt any
+    # vulnerability advisory. Reachability, migration gates and review dates:
+    # docs/security-dependency-followups.md#dep-001-replace-unsafe-libyaml
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml has no patch replacing unsafe-libyaml; member-authored workflow YAML is production reachable; migrate under DEP-001, review by 2026-10-23" },
+    # docs/security-dependency-followups.md#dep-002-migrate-mesh-nostr-and-desktop-lock
+    { id = "RUSTSEC-2026-0243", reason = "relay dev-only mesh-llm 0.74 pins nostr-sdk 0.44; standalone pool removal requires SDK migration; DEP-002, review by 2026-10-23" },
     # quick-xml < 0.41: quadratic runtime on duplicate-attribute check (0194) and
     # unbounded namespace-declaration allocation in NsReader (0195). Both DoS-class,
     # requiring attacker-controlled XML. Our two locked versions only parse trusted

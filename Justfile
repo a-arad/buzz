@@ -319,6 +319,9 @@ test-unit:
         # because nothing in CI runs `cargo test --workspace` — workspace
         # membership alone buys clippy/check, not a single executed test.
         cargo nextest run -p buzz-backend-kubernetes
+        # Stored workflow templates carry delegated mention authority. Keep the
+        # full infra-free workflow suite in both unit-test entry points.
+        cargo nextest run -p buzz-workflow --lib
     else
         ./scripts/run-tests.sh unit
     fi

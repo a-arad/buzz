@@ -54,7 +54,9 @@ pub trait ActionSink: Send + Sync {
     ///   carries its owning community so a workflow in community B posts into B
     ///   even though the side effect has no inbound connection to bind.
     /// - `channel_id`: UUID string of the target channel
-    /// - `text`: message body (must not be empty/whitespace-only)
+    /// - `text`: rendered message body (must not be empty/whitespace-only)
+    /// - `authored_text`: stored, unrendered template used to identify targets
+    ///   explicitly named by the workflow owner, before trigger interpolation
     /// - `author_pubkey`: hex-encoded pubkey of the workflow owner (used for
     ///   the `p` attribution tag; the relay keypair signs the event)
     ///
@@ -64,6 +66,7 @@ pub trait ActionSink: Send + Sync {
         community_id: CommunityId,
         channel_id: &str,
         text: &str,
+        authored_text: &str,
         author_pubkey: &str,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
 }

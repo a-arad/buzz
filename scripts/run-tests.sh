@@ -112,6 +112,10 @@ run_unit_tests() {
   # the two lists must stay in step or the fallback silently covers less.
   run_test_step "buzz-backend-kubernetes tests" \
     cargo test -p buzz-backend-kubernetes -- --nocapture
+
+  # Keep the full infra-free workflow suite in step with `just test-unit`.
+  run_test_step "buzz-workflow unit tests" \
+    cargo test -p buzz-workflow --lib -- --nocapture
 }
 
 # ---- DB / integration tests (infra required) --------------------------------
@@ -120,6 +124,11 @@ run_integration_tests() {
   section "Integration Tests (requires running services)"
 
   ensure_infra
+
+  # Exercise persisted owner/template provenance, including the ignored
+  # PostgreSQL tests, just as the hosted backend-integration lane does.
+  run_test_step "workflow message provenance tests" \
+    cargo test -p buzz-relay --lib workflow_sink -- --include-ignored --nocapture
 
   run_test_step "buzz-db tests" \
     cargo test -p buzz-db -- --nocapture
