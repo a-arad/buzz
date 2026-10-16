@@ -78,6 +78,7 @@ for line in sys.stdin:
             ("FAIL_FIRST".into(), (case != "durable-success").to_string()),
         ],
         has_generated_codex_config: false,
+        initialize_timeout: Duration::from_secs(60),
         model: None,
         effort_level: None,
         observer: None,
