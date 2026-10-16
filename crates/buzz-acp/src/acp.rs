@@ -692,10 +692,21 @@ impl AcpClient {
     /// arm can choose [`ACP_STEER_METHOD`] for adapters that implement it.
     /// Parsed here rather than at each call site so no caller can forget it.
     pub async fn initialize(&mut self) -> Result<serde_json::Value, AcpError> {
+        self.initialize_with_timeout(Self::REQUEST_TIMEOUT).await
+    }
+
+    /// [`initialize`](Self::initialize) under an operator-configured deadline.
+    /// Pool startup and respawn use this; every other RPC keeps `REQUEST_TIMEOUT`.
+    pub(crate) async fn initialize_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         // Requesting version 2 is an intentional temporary pin — we are squatting
         // on ACP v2 ahead of the upstream ACP RFD. Revisit when that RFD merges.
         let params = build_initialize_params();
-        let result = self.send_request("initialize", params).await?;
+        let result = self
+            .send_request_with_timeout("initialize", params, timeout)
+            .await?;
         self.steering_supported = result
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
@@ -1284,6 +1295,7 @@ impl AcpClient {
     }
 
     /// Default timeout for non-prompt RPCs (initialize, session/new, etc.).
+    /// Pool startup and respawn may give `initialize` a configured deadline.
     const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Send a JSON-RPC request and wait for the matching response.
@@ -1300,6 +1312,16 @@ impl AcpClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, AcpError> {
+        self.send_request_with_timeout(method, params, Self::REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value, AcpError> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -1315,7 +1337,6 @@ impl AcpClient {
         // Wrap write + read in a single timeout so a hung agent can't block forever.
         // We cannot use an async block that borrows `self` mutably across two awaits
         // inside timeout(), so we sequence them with early-return on timeout.
-        let timeout = Self::REQUEST_TIMEOUT;
         match tokio::time::timeout(timeout, self.write_ndjson(&msg)).await {
             Ok(result) => result?,
             Err(_) => return Err(AcpError::Timeout(timeout)),
@@ -3483,6 +3504,22 @@ mod tests {
             }
             client.shutdown().await;
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_deadline_can_exceed_request_timeout() {
+        // The paused clock jumps to the first pending timer, so the deadline
+        // reported is the one that governs `initialize`.
+        let mut client = spawn_script("sleep 30").await;
+        let deadline = AcpClient::REQUEST_TIMEOUT * 3;
+        let start = tokio::time::Instant::now();
+        let result = client.initialize_with_timeout(deadline).await;
+        assert!(
+            matches!(result, Err(AcpError::Timeout(elapsed)) if elapsed == deadline),
+            "{result:?}"
+        );
+        assert!(start.elapsed() >= deadline);
+        client.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

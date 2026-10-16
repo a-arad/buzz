@@ -5,6 +5,8 @@ mod durable_startup_tests;
 mod git;
 #[cfg(all(test, unix))]
 mod git_runtime_tests;
+#[cfg(all(test, unix))]
+mod initialize_deadline_tests;
 
 mod acp;
 mod config;
@@ -3342,10 +3344,20 @@ async fn run_harness(
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let initialize_timeout = Duration::from_secs(config.initialize_timeout_secs);
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        initialize_timeout,
+                        idx,
+                        observer,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -5851,12 +5863,22 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let initialize_timeout = Duration::from_secs(config.initialize_timeout_secs);
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            initialize_timeout,
+            i,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 }
@@ -6112,6 +6134,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let initialize_timeout = Duration::from_secs(config.initialize_timeout_secs);
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -6123,7 +6146,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            initialize_timeout,
+            index,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -6167,7 +6199,7 @@ async fn initialize_agent_pool(
 ) -> Result<AgentPool> {
     // Stateless pools may start partially. Durable pools need every worker's
     // history before ownership reconstruction; validate that after initialization.
-    // Attempt each spawn under a 60-second timeout.
+    // Attempt each spawn under the configured initialize deadline.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(startup.agents as usize);
     for i in 0..startup.agents as usize {
         let state = match SessionState::restore(i, &startup.session_identity) {
@@ -6187,7 +6219,7 @@ async fn initialize_agent_pool(
         match spawn_result {
             Ok(mut acp) => {
                 acp.set_observer(startup.observer.clone(), i);
-                let initialize = tokio::time::timeout(Duration::from_secs(60), acp.initialize());
+                let initialize = acp.initialize_with_timeout(startup.initialize_timeout);
                 let initialize_result = match shutdown.as_mut() {
                     Some(shutdown) => tokio::select! {
                         biased;
@@ -6201,7 +6233,7 @@ async fn initialize_agent_pool(
                     None => initialize.await,
                 };
                 match initialize_result {
-                    Ok(Ok(init_result)) => {
+                    Ok(init_result) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
                         let protocol_version =
                             init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
@@ -6242,13 +6274,8 @@ async fn initialize_agent_pool(
                             protocol_version,
                         }));
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         tracing::error!(agent = i, "agent initialize failed: {e}");
-                        acp.shutdown().await;
-                        agent_slots.push(None);
-                    }
-                    Err(_) => {
-                        tracing::error!(agent = i, "agent timed out during init (60s)");
                         acp.shutdown().await;
                         agent_slots.push(None);
                     }
@@ -6302,6 +6329,7 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    initialize_timeout: Duration,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
@@ -6310,7 +6338,7 @@ async fn spawn_and_init(
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
-    match acp.initialize().await {
+    match acp.initialize_with_timeout(initialize_timeout).await {
         Ok(init_result) => {
             tracing::info!("agent initialized: {init_result}");
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
@@ -10248,6 +10276,7 @@ mod build_mcp_servers_tests {
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
+            initialize_timeout_secs: config::DEFAULT_INITIALIZE_TIMEOUT_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
@@ -11345,6 +11374,7 @@ mod error_outcome_emission_tests {
             mcp_command: "test-mcp-server".into(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
+            initialize_timeout_secs: config::DEFAULT_INITIALIZE_TIMEOUT_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
