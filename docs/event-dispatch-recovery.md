@@ -102,11 +102,17 @@ same trigger event.
 ## Rolling back
 
 A relay binary without 0058 in its migration set refuses to start with
-`BUZZ_AUTO_MIGRATE=true`: sqlx reports the applied version as missing. Roll back
-the binary with `BUZZ_AUTO_MIGRATE=false`, which skips the migrator. Do not
-delete the `_sqlx_migrations` row or restore an older database.
+`BUZZ_AUTO_MIGRATE=true`: sqlx reports "migration 58 was previously applied but
+is missing in the resolved migrations". Roll back the binary with
+`BUZZ_AUTO_MIGRATE=false`, which skips the migrator. Do not delete the
+`_sqlx_migrations` rows or restore an older database.
 
-The older binary ignores the queue table and both indexes. It writes no
-obligations and leaves existing rows alone. Rows still in the table when the
-newer binary returns are dispatched then, so their workflows fire late. Inspect
-them before rolling forward and delete any you do not want delivered.
+The older binary writes no obligations and leaves existing rows alone. It still
+works with both indexes. If it tries to create a second run of one workflow for
+the same trigger event, the unique index rejects it with an error. On main, its
+community-deletion catalog check also does not know `event_dispatch_queue`.
+Community deletions therefore stay blocked until the newer binary returns.
+
+Rows still in the table when the newer binary returns are dispatched then, so
+their workflows fire late. Inspect them before rolling forward, and delete any
+you do not want delivered.
