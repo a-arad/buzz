@@ -1,0 +1,150 @@
+# Temporary qualification for PR26/PR27: lives only on its own branch and is
+# not proposed for merge. Builds buzz-audit's test binary at the fix commit and
+# at its parent, then runs log_once_records_an_object_once against a healthy
+# database, a rejected password and a missing database while Postgres is up.
+name: Audit fail-closed qualification
+
+on:
+  push:
+    branches: [claude/audit-failclosed-qual-20261018]
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: audit fail-closed (${{ matrix.line }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - line: stable
+            ref: 24d495eb53531d42bc05e2136a8a94d65ba3810d
+            test: service::tests::log_once_records_an_object_once
+            reconcile: scripts/attach-schema-partitions.sql
+          - line: main
+            ref: fa2bfd94bc97c9f8c797d0f6a7cace4b24ed004d
+            test: service::postgres_tests::log_once_records_an_object_once
+            reconcile: scripts/reconcile-schema-after-pgschema.sql
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: buzz
+          POSTGRES_PASSWORD: buzz_dev
+          POSTGRES_DB: buzz
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U buzz -d buzz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: buzz
+      PGPASSWORD: buzz_dev
+      PGDATABASE: buzz
+      PGSCHEMA_PLAN_HOST: localhost
+      PGSCHEMA_PLAN_PORT: "5432"
+      PGSCHEMA_PLAN_DB: buzz
+      PGSCHEMA_PLAN_USER: buzz
+      PGSCHEMA_PLAN_PASSWORD: buzz_dev
+      TEST_NAME: ${{ matrix.test }}
+      RECONCILE_SQL: ${{ matrix.reconcile }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ matrix.ref }}
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: rui314/setup-mold@7e4f20ad28a2e8ca6fd0892ccf72e2abb706b9c3 # v1
+      - name: Apply schema
+        run: |
+          set -euo pipefail
+          git log -2 --format='%H %s'
+          ./bin/pgschema apply --file schema/schema.sql --auto-approve
+          /usr/bin/psql -v ON_ERROR_STOP=1 < "$RECONCILE_SQL"
+      - name: Build post-fix and pre-fix test binaries
+        run: |
+          set -euo pipefail
+          build() {
+            cargo test -p buzz-audit --lib --no-run --message-format json \
+              | jq -r 'select(.reason == "compiler-artifact" and .target.name == "buzz_audit"
+                       and .profile.test == true) | .executable' | tail -n 1
+          }
+          post="$(build)"
+          cp "$post" /tmp/audit-post
+          git show HEAD^:crates/buzz-audit/src/service.rs > crates/buzz-audit/src/service.rs
+          git diff --stat HEAD
+          test "$(git diff --name-only HEAD)" = crates/buzz-audit/src/service.rs
+          pre="$(build)"
+          cp "$pre" /tmp/audit-pre
+          git checkout -- crates/buzz-audit/src/service.rs
+          test -z "$(git status --porcelain)"
+          sha256sum /tmp/audit-pre /tmp/audit-post
+          echo "post binary has the expect message: $(grep -c 'connect to DATABASE_URL' /tmp/audit-post)"
+          echo "pre binary has the expect message: $(grep -c 'connect to DATABASE_URL' /tmp/audit-pre || true)"
+      - name: Run cases
+        run: |
+          set -uo pipefail
+          url_for() {
+            case "$1" in
+              good) echo postgres://buzz:buzz_dev@localhost:5432/buzz ;;
+              badpw) echo postgres://buzz:not_the_password@localhost:5432/buzz ;;
+              nodb) echo postgres://buzz:buzz_dev@localhost:5432/buzz_absent_db ;;
+            esac
+          }
+          counts() {
+            /usr/bin/psql "$(url_for good)" -qtAc \
+              "SELECT (SELECT count(*) FROM communities) || ' ' || (SELECT count(*) FROM audit_log)"
+          }
+          printf 'build\tcase\ttest_exit\tran_1\tcommunities_delta\taudit_delta\tport_open\tpsql_exit\n' > /tmp/results.tsv
+          for build in pre post; do
+            for case in good badpw nodb; do
+              url="$(url_for "$case")"
+              port_open=no
+              if /usr/bin/pg_isready -h localhost -p 5432 -q; then port_open=yes; fi
+              /usr/bin/psql "$url" -qtAc 'SELECT 1' > "/tmp/psql.$build.$case.log" 2>&1
+              psql_exit=$?
+              read -r c0 a0 < <(counts)
+              DATABASE_URL="$url" timeout 120 "/tmp/audit-$build" --ignored --exact "$TEST_NAME" \
+                --nocapture > "/tmp/run.$build.$case.log" 2>&1
+              test_exit=$?
+              read -r c1 a1 < <(counts)
+              ran=$(grep -c '^running 1 test$' "/tmp/run.$build.$case.log")
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$build" "$case" "$test_exit" "$ran" \
+                "$((c1 - c0))" "$((a1 - a0))" "$port_open" "$psql_exit" >> /tmp/results.tsv
+              echo "::group::$build $case (test exit $test_exit)"
+              echo "--- psql probe (exit $psql_exit)"
+              cat "/tmp/psql.$build.$case.log"
+              echo "--- test output"
+              cat "/tmp/run.$build.$case.log"
+              echo "::endgroup::"
+            done
+          done
+          column -t -s $'\t' /tmp/results.tsv
+      - name: Check expected outcomes
+        run: |
+          set -euo pipefail
+          # build case test_exit ran_1 communities_delta audit_delta port_open psql_exit
+          cat > /tmp/expected.txt <<'EOF'
+          pre good 0 1 1 3 yes 0
+          pre badpw 0 1 0 0 yes 2
+          pre nodb 0 1 0 0 yes 2
+          post good 0 1 1 3 yes 0
+          post badpw 101 1 0 0 yes 2
+          post nodb 101 1 0 0 yes 2
+          EOF
+          diff <(tail -n +2 /tmp/results.tsv | tr '\t' ' ') /tmp/expected.txt
+          grep -q 'password authentication failed' /tmp/psql.post.badpw.log
+          grep -q 'database "buzz_absent_db" does not exist' /tmp/psql.post.nodb.log
+          grep -q 'connect to DATABASE_URL' /tmp/run.post.badpw.log
+          grep -q 'connect to DATABASE_URL' /tmp/run.post.nodb.log
+          grep -q 'test result: ok. 1 passed' /tmp/run.pre.badpw.log
+          grep -q 'test result: ok. 1 passed' /tmp/run.pre.nodb.log
+          echo "all six outcomes match"
