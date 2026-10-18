@@ -2562,6 +2562,66 @@ mod tests {
             );
         }
 
+        /// A recovery pass runs dispatch again for an event whose earlier pass
+        /// may already have recorded its audit entry: every pass reports the
+        /// entry recorded, and the chain holds it once.
+        #[tokio::test]
+        async fn repeated_dispatch_records_event_created_once() {
+            use buzz_core::event::StoredEvent;
+            use buzz_core::tenant::{CommunityId, TenantContext};
+
+            let Some((state, audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping repeated-dispatch audit test: Postgres/Redis unavailable");
+                return;
+            };
+            let community_uuid = Uuid::new_v4();
+            let host = format!("audit-once-test-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("seed community");
+            let tenant = TenantContext::resolved(CommunityId::from_uuid(community_uuid), host);
+            let actor = Keys::generate();
+            let event = EventBuilder::new(Kind::from(KIND_PRESENCE_UPDATE as u16), "online")
+                .tags([nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow tag")])
+                .sign_with_keys(&state.relay_keypair)
+                .expect("sign relay event");
+            let event_id_hex = event.id.to_hex();
+            let stored = StoredEvent::new(event, None);
+
+            for pass in 0..3 {
+                let outcome = super::super::dispatch_persistent_event_inner(
+                    &tenant,
+                    &state,
+                    &stored,
+                    KIND_PRESENCE_UPDATE,
+                    &actor.public_key().to_hex(),
+                    super::super::AuditStep::Enqueue,
+                    None,
+                    pass > 0,
+                )
+                .await;
+                assert_eq!(outcome.failure, None, "pass {pass} completes every effect");
+            }
+            audit_shutdown
+                .drain(std::time::Duration::from_secs(5))
+                .await;
+
+            let recorded: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log \
+                 WHERE community_id = $1 AND action = 'event_created' AND object_id = $2",
+            )
+            .bind(community_uuid)
+            .bind(&event_id_hex)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit rows");
+            assert_eq!(recorded, 1);
+        }
+
         /// Integrated isolation: a community resolved from the request's
         /// `TenantContext` at relay ingest lands in *that* community's audit
         /// chain and nothing else. This is the conformance `audit_log` row's

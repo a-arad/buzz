@@ -2938,7 +2938,7 @@ pub(crate) mod tests {
         let audit = Arc::new(AuditService::new(audit_pool));
         let worker = tokio::spawn({
             let audit = Arc::clone(&audit);
-            async move { log_audit_entry(&audit, entry).await }
+            async move { log_audit_entry(&audit, AuditJob::Entry(entry)).await }
         });
 
         // Observe one timed-out advisory-lock attempt and then a second wait.

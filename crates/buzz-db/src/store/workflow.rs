@@ -2383,6 +2383,103 @@ mod postgres_tests {
         (workflow_id, community)
     }
 
+    /// A trigger event has one run per workflow, a run is claimed for
+    /// execution once, and recovery cancels only never-started runs of
+    /// workflows it did not select.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn event_triggered_runs_are_created_and_claimed_once() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (selected, _) = make_workflow_in(&pool, community).await;
+        let (unselected, _) = make_workflow_in(&pool, community).await;
+        let trigger = Uuid::new_v4().as_bytes().repeat(2);
+
+        let run = create_workflow_run(&pool, community, selected, Some(&trigger), None)
+            .await
+            .expect("create run");
+        let again = create_workflow_run(&pool, community, selected, Some(&trigger), None)
+            .await
+            .expect("create run again");
+        assert_eq!(run, again, "one run per (workflow, trigger event)");
+        let untriggered = [
+            create_workflow_run(&pool, community, selected, None, None)
+                .await
+                .expect("untriggered run"),
+            create_workflow_run(&pool, community, selected, None, None)
+                .await
+                .expect("untriggered run"),
+        ];
+        assert_ne!(
+            untriggered[0], untriggered[1],
+            "runs without a trigger are always new"
+        );
+
+        assert!(claim_workflow_run(&pool, community, run)
+            .await
+            .expect("claim"));
+        assert!(
+            !claim_workflow_run(&pool, community, run)
+                .await
+                .expect("claim again"),
+            "a run is claimed once"
+        );
+
+        // Concurrent dispatches of one event create and claim one run.
+        let racing_trigger = Uuid::new_v4().as_bytes().repeat(2);
+        let racers = (0..8).map(|_| {
+            let pool = pool.clone();
+            let trigger = racing_trigger.clone();
+            tokio::spawn(async move {
+                let id = create_workflow_run(&pool, community, selected, Some(&trigger), None)
+                    .await
+                    .expect("racing create");
+                (
+                    id,
+                    claim_workflow_run(&pool, community, id)
+                        .await
+                        .expect("racing claim"),
+                )
+            })
+        });
+        let mut ids = std::collections::HashSet::new();
+        let mut claims = 0;
+        for racer in racers {
+            let (id, claimed) = racer.await.expect("racer");
+            ids.insert(id);
+            claims += usize::from(claimed);
+        }
+        assert_eq!((ids.len(), claims), (1, 1));
+
+        // Recovery cancels the reserved run of the workflow it did not select
+        // and leaves the started one alone.
+        let reserved = create_workflow_run(&pool, community, unselected, Some(&trigger), None)
+            .await
+            .expect("reserved run");
+        let cancelled = cancel_unselected_pending_runs(&pool, community, &trigger, &[selected])
+            .await
+            .expect("cancel");
+        assert_eq!(cancelled, 1);
+        let reserved = get_workflow_run(&pool, community, reserved)
+            .await
+            .expect("reserved");
+        assert_eq!(reserved.status, RunStatus::Cancelled);
+        assert_eq!(
+            reserved.error_code.as_deref(),
+            Some("not_selected_on_recovery")
+        );
+        let started = get_workflow_run(&pool, community, run)
+            .await
+            .expect("started");
+        assert_eq!(started.status, RunStatus::Running);
+        assert!(
+            !claim_workflow_run(&pool, community, reserved.id)
+                .await
+                .expect("claim cancelled"),
+            "a cancelled run never starts"
+        );
+    }
+
     /// Confinement: a duplicate workflow UUID existing in both community A and
     /// community B must claim independently. Claiming `(A, id, t)` must NOT
     /// consume `(B, id, t)` — B's identical instant stays claimable, and the

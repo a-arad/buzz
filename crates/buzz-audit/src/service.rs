@@ -461,6 +461,48 @@ mod postgres_tests {
         assert_eq!(rows[1].hash_version, CURRENT_HASH_VERSION);
     }
 
+    /// `log_once` records an object's entry once, including under concurrent
+    /// writers, and the chain stays intact.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn log_once_records_an_object_once() {
+        let _g = db_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = std::sync::Arc::new(AuditService::new(pool.clone()));
+        let c = make_community(&pool).await;
+        let entry = new_entry(c, AuditAction::EventCreated);
+
+        let writers = (0..6).map(|_| {
+            let svc = std::sync::Arc::clone(&svc);
+            let entry = entry.clone();
+            tokio::spawn(async move { svc.log_once(entry).await.unwrap() })
+        });
+        let mut written = 0;
+        for writer in writers {
+            written += usize::from(writer.await.unwrap().is_some());
+        }
+        assert_eq!(written, 1, "exactly one concurrent writer appends");
+        assert!(svc.log_once(entry.clone()).await.unwrap().is_none());
+
+        // Another action on the same object, and another object, still append.
+        let other_action = NewAuditEntry {
+            action: AuditAction::ChannelCreated,
+            ..entry.clone()
+        };
+        assert!(svc.log_once(other_action).await.unwrap().is_some());
+        assert!(svc
+            .log_once(new_entry(c, AuditAction::EventCreated))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(svc
+            .verify_chain(CommunityId::from_uuid(c), 1, 3)
+            .await
+            .unwrap());
+    }
+
     /// THE isolation property: two communities keep independent chains. Each
     /// starts at seq 1; interleaving writes does not link them; verifying one
     /// never traverses the other.
