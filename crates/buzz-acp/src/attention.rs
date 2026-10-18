@@ -12,8 +12,13 @@ pub(crate) async fn prompt(context: &Value) -> Option<String> {
         Ok(inventory) => format!("Owned commitment inventory: {inventory}"),
         Err(error) => format!("Owned commitment inventory unavailable: {error}. This is not an empty set; additive authoring remains blocked until it can be reviewed."),
     };
+    let origin_note = if context["link"].is_null() {
+        "Legacy reminder has no task origin. Inventory spans your own tasks; choose the originating context before authoring."
+    } else {
+        ""
+    };
     let text = format!(
-        "Origin supplied by Buzz: {context}\n{content}\n\
+        "Origin supplied by Buzz: {context}\n{origin_note}\n{content}\n\
          Use edamame-watch for all future attention. Pass the originating link with --context when it is not already in your environment. \
          Create, update, renew, rearm, snooze and completion return the owned set for explicit review before writing. \
          A triggering reminder needs a disposition: complete/cancel, or reschedule to an explicit future boundary. \

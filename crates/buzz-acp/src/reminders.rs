@@ -277,10 +277,9 @@ pub(super) async fn run(
                         Some(json!({"link": format!("buzz://message?channel={channel}&id={event}"),
                                     "policy": std::env::var("BUZZ_ACP_SESSION_POLICY").unwrap_or_else(|_| "channel".into()),
                                     "trigger_id": format!("time:{}", reminder.id), "trigger_event": reminder.event_id}))
-                    }).unwrap_or_else(|| json!({"link": null, "origin": "unassigned",
+                    }).unwrap_or_else(|| json!({"link": null,
                         "policy": std::env::var("BUZZ_ACP_SESSION_POLICY").unwrap_or_else(|_| "channel".into()),
-                        "trigger_id": format!("time:{}", reminder.id), "trigger_event": reminder.event_id,
-                        "instruction": "Legacy reminder has no task origin. Inventory spans your own tasks; choose the originating context before authoring."}))),
+                        "trigger_id": format!("time:{}", reminder.id), "trigger_event": reminder.event_id}))),
                 }),
                 ctx,
                 result_tx,
