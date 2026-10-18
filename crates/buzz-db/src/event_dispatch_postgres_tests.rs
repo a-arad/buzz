@@ -78,10 +78,10 @@ async fn row(
 
 /// Make the obligation due ahead of any other in the database: a claim takes
 /// the community of the earliest due row, and a shared test database can hold
-/// rows other runs left due.
+/// rows other runs left due. A finite time, because `row` subtracts it.
 async fn make_due(pool: &PgPool, community: CommunityId, event: &Event) {
     sqlx::query(
-        "UPDATE event_dispatch_queue SET next_attempt_at = '-infinity' \
+        "UPDATE event_dispatch_queue SET next_attempt_at = 'epoch' \
          WHERE community_id = $1 AND event_id = $2",
     )
     .bind(community.as_uuid())
