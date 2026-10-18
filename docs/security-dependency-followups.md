@@ -1,18 +1,24 @@
 # Dependency migration follow-ups
 
-These open items track the exact advisory exceptions in `deny.toml` that
-have no lock-only fix. The repository `a-arad/buzz` has issues disabled, so
-this versioned tracker retains the work instead of silently dropping it.
-Review every exception by **2026-10-23 UTC**; that date is a maintenance
-commitment, not a cargo-deny-enforced expiry. DEP-001 matches the stable
-0.2.x line. DEP-002 (standalone `nostr-relay-pool`) exists only on stable;
-main's mesh-llm 0.76.2 uses nostr-sdk 0.45, which no longer pulls it in.
+These open items track the advisory exceptions this register adds to
+`deny.toml`; none has a lock-only fix. The older instant, paste and
+quick-xml exceptions predate it and are not tracked here; quick-xml's
+RUSTSEC-2026-0194 and 0195 are vulnerability exceptions. The repository
+`a-arad/buzz` has issues disabled, so this versioned tracker retains the
+work instead of silently dropping it. Review every exception in this
+register by **2026-10-23 UTC**; that date is a maintenance commitment, not
+a cargo-deny-enforced expiry. DEP-001 matches the stable 0.2.x line. DEP-002
+(standalone `nostr-relay-pool`) exists only on stable; main's mesh-llm
+0.76.2 uses nostr-sdk 0.45, which no longer pulls it in.
 
 Reachability claims below come from `cargo tree --locked -e normal,build`
-for every root workspace member on `x86_64-unknown-linux-gnu` and
-`aarch64-apple-darwin`, plus the image build sets
-(`-p buzz-relay -p buzz-admin -p buzz-pair-relay`, `-p buzz-push-gateway`,
-`-p sprig`). They do not cover the separate `desktop/src-tauri` graph.
+with default features for every root workspace member on
+`x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`, plus the image build
+sets (`-p buzz-relay -p buzz-admin -p buzz-pair-relay`, `-p buzz-push-gateway`,
+`-p sprig`) on `x86_64-` and `aarch64-unknown-linux-gnu`. A failed cargo
+command fails the check; it is not evidence of absence. The claims cover only
+those graphs: not the separate `desktop/src-tauri` graph (see the end of this
+file), other feature sets, or other targets.
 
 ## DEP-001: Replace unsafe-libyaml
 
@@ -62,25 +68,28 @@ only in zip 9.0.0, which is semver-incompatible with the lock.
 
 The only root path is `buzz-mesh-smoke [dev] → mesh-llm 0.76.2
 (mesh-llm-host-runtime, -plugin-manager, -system) → zip ^8.6`. No root
-workspace crate depends on zip, and zip is compiled into no shipped
-artifact. The latest mesh-llm tag checked, v0.78.1, still locks zip 8.6.0.
+workspace crate depends on zip directly, and zip is absent from every graph
+checked above. The latest mesh-llm tag checked, v0.78.1, still locks zip 8.6.0.
 
 At the pinned tag, mesh-llm extracts ZIP archives in
 `mesh-llm-system/src/autoupdate/release_fetch.rs::extract_zip_archive` and
 `mesh-llm-plugin-manager/src/archive.rs::extract_zip`. Both iterate entries
 with `by_index`, reject paths without `enclosed_name`, and write regular
 files with `File::create` and `io::copy`. Neither calls `extract()`, reads
-`unix_mode`, or creates symlinks. That is why the exception is limited to
-test builds; it is not a claim that zip 8.6 is safe for other callers.
+`unix_mode`, or creates symlinks. This supports only these three advisories
+at these call sites. It does not show that zip 8.6 is safe for other callers,
+or that extraction into arbitrary existing filesystem state (for example, a
+destination that already contains symlinks) is safe.
 
 Completion criteria:
 
 - Adopt a mesh-llm release that uses zip ≥ 9 (or drops zip), run the mesh
   smoke and lifecycle tests, remove the three exact IDs, and pass
   `cargo-deny check`.
-- Until then, at each mesh-llm pin change, re-run the reachability check
-  above and re-read the mesh ZIP call sites; drop the exception if either
-  claim stops holding.
+- Until then, at each dependency or feature change on this path (the
+  mesh-llm pin, its features, or a new zip consumer), re-run the reachability
+  check above and re-read the mesh ZIP call sites. Remove the exception if zip
+  reaches a checked graph or the call-site claim stops holding.
 - The desktop graph locks zip separately and is not covered here.
 
 ## DEP-004: Move mesh keyring off zbus 5
@@ -93,14 +102,23 @@ Completion criteria:
 zbus 6.0.0. There is no patched standalone version.
 
 The only root path is `buzz-mesh-smoke [dev] → mesh-llm 0.76.2 →
-keyring 4.2.0 → zbus-secret-service-keyring-store 1.0.1 → zbus ^5`. These
-crates are compiled into no shipped artifact. zbus 6.0.0 was released on
-2026-10-16, but the newest keyring (4.2.0) and keyring store (1.0.1) still
-require zbus 5, and mesh-llm v0.78.1 still locks zbus 5.19.0.
+keyring 4.2.0 → zbus-secret-service-keyring-store 1.0.1 → zbus ^5`.
+These crates are absent from every graph checked above. zbus 6.0.0 was
+released on 2026-10-16, but the newest keyring (4.2.0) and keyring store
+(1.0.1) still require zbus 5, and mesh-llm v0.78.1 still locks zbus 5.19.0.
 
 Completion criteria:
 
 - Adopt a keyring and mesh-llm release on zbus 6, run the mesh smoke and
   lifecycle tests, remove the three exact IDs, and pass `cargo-deny check`.
-- Re-run the reachability check at each mesh-llm pin change; a normal-edge
-  path would turn these into production maintenance risk and needs review.
+- Re-run the reachability check at each dependency or feature change on this
+  path (the mesh-llm or keyring pin, or their features). Remove the exception
+  if a checked graph gains a path; that is production maintenance risk and
+  needs a new review.
+
+**Separate desktop security follow-up, still open:**
+`desktop/src-tauri/Cargo.lock` is a separate graph. CI Security does not
+check it, and no entry above covers it. On this branch it locks negentropy
+0.5.0, rustls 0.23.45, zip 4.6.1 and 8.6.0, zbus/zvariant 4 and 5, and
+unsafe-libyaml 0.2.11. Audit that graph and qualify native desktop builds
+separately; a passing root `cargo-deny check` says nothing about desktop.
