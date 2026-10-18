@@ -3386,6 +3386,68 @@ mod tests {
             assert_eq!(frames_for(&mut reader_rx, &mut seen, &event), 0);
         }
 
+        /// A community that is archived when recovery claims its obligations
+        /// keeps them: archiving can be undone, so they back off toward
+        /// `held` instead of being dropped. Mutation: delete the batch when
+        /// the host lookup finds no served community → RED.
+        #[tokio::test]
+        async fn archived_community_keeps_its_obligations() {
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping archived community test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-archived").await;
+            let community = tenant.community();
+            let author_pk = author.public_key().to_bytes().to_vec();
+            let event = EventBuilder::new(Kind::Custom(9), "community archived before recovery")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let (stored, inserted) = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                Some(author_pk.clone()),
+            )
+            .scope(state.db.insert_event_with_thread_metadata(
+                community,
+                &event,
+                Some(channel_id),
+                None,
+            ))
+            .await
+            .expect("insert under obligation");
+            assert!(inserted);
+            sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+                .bind(community.as_uuid())
+                .execute(&pool)
+                .await
+                .expect("archive community");
+            recover_once(&state, &pool, &tenant, &stored, &author_pk).await;
+            let kept: Option<(String, i32, Option<String>)> = sqlx::query_as(
+                "SELECT state, attempts, last_error FROM event_dispatch_queue \
+                 WHERE community_id = $1 AND event_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .fetch_optional(&pool)
+            .await
+            .expect("read obligation");
+            assert_eq!(
+                kept,
+                Some((
+                    "pending".to_owned(),
+                    1,
+                    Some("community not served".to_owned())
+                ))
+            );
+            sqlx::query("DELETE FROM event_dispatch_queue WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .execute(&pool)
+                .await
+                .expect("clean up obligation");
+        }
+
         /// Integrated isolation: a community resolved from the request's
         /// `TenantContext` at relay ingest lands in *that* community's audit
         /// chain and nothing else. This is the conformance `audit_log` row's
