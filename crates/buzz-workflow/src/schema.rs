@@ -97,6 +97,12 @@ pub enum ActionDef {
         /// Optional channel UUID override. Must be a valid UUID string.
         #[serde(default)]
         channel: Option<String>,
+        /// Literal canonical root for scheduled task continuations.
+        #[serde(default)]
+        thread_root: Option<String>,
+        /// The stable relay requires an explicit destination, not an implicit trigger reply.
+        #[serde(default)]
+        reply_in_thread: bool,
     },
     /// Send a direct message to a user.
     SendDm {
@@ -186,6 +192,18 @@ impl WorkflowDef {
 
         let mut seen_ids: HashSet<&str> = HashSet::new();
         for step in &self.steps {
+            if matches!(
+                &step.action,
+                ActionDef::SendMessage {
+                    reply_in_thread: true,
+                    ..
+                }
+            ) {
+                return Err(WorkflowError::InvalidDefinition(
+                    "This relay requires an explicit thread_root; reply_in_thread is unsupported"
+                        .into(),
+                ));
+            }
             if step.id.trim().is_empty() {
                 return Err(WorkflowError::InvalidDefinition(
                     "step id must not be empty".into(),
@@ -233,6 +251,24 @@ impl WorkflowDef {
                 if secs < 60 {
                     return Err(WorkflowError::InvalidDefinition(
                         "interval must be at least 60s (cron loop ticks every 60 seconds)".into(),
+                    ));
+                }
+            }
+        }
+
+        for step in &self.steps {
+            if let ActionDef::SendMessage {
+                thread_root: Some(root),
+                ..
+            } = &step.action
+            {
+                if root.len() != 64
+                    || !root
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                {
+                    return Err(WorkflowError::InvalidDefinition(
+                        "thread_root must be a lowercase 64-character event ID".into(),
                     ));
                 }
             }
@@ -320,6 +356,18 @@ mod tests {
             }
             other => panic!("unexpected trigger: {other:?}"),
         }
+    }
+
+    #[test]
+    fn scheduled_root_is_literal_validated_and_cannot_mix_reply_modes() {
+        let root = "a".repeat(64);
+        let yaml = format!("name: Continue\ntrigger:\n  on: schedule\n  cron: '0 0 9 20 10 * 2026'\nsteps:\n  - id: wake\n    action: send_message\n    text: Continue\n    thread_root: {root}\n");
+        let (def, _) = parse_yaml(&yaml).unwrap();
+        assert!(
+            matches!(&def.steps[0].action, ActionDef::SendMessage { thread_root: Some(value), .. } if value == &root)
+        );
+        assert!(parse_yaml(&yaml.replace(&root, "not-a-root")).is_err());
+        assert!(parse_yaml(&(yaml + "    reply_in_thread: true\n")).is_err());
     }
 
     #[test]
