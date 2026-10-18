@@ -467,9 +467,9 @@ mod postgres_tests {
     #[ignore = "requires Postgres"]
     async fn log_once_records_an_object_once() {
         let _g = db_lock().lock().await;
-        let Some(pool) = test_pool().await else {
-            return;
-        };
+        // CI's dispatch contract step selects this test, so an unreachable
+        // database must fail it instead of passing without running.
+        let pool = test_pool().await.expect("connect to DATABASE_URL");
         let svc = std::sync::Arc::new(AuditService::new(pool.clone()));
         let c = make_community(&pool).await;
         let entry = new_entry(c, AuditAction::EventCreated);
