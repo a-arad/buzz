@@ -507,6 +507,65 @@ jobs:
           VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:3000')
           ON CONFLICT (lower(host)) DO NOTHING
           ;"
+      - name: Dispatch obligation relay tests
+        # Relay tests for docs/event-dispatch-recovery.md. They are not
+        # #[ignore]d, so the PostgreSQL lane does not select them, and they
+        # return early when Postgres or Redis is unreachable. Run them first,
+        # against the reconciled schema and before the relay starts: its
+        # recovery worker claims due obligations from the whole database. The
+        # listing fails the step if a test was renamed away.
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          BUZZ_TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+        run: |
+          set -euo pipefail
+          archive=target/ci/backend-integration-tests.tar.zst
+          expected='buzz-relay archived_community_keeps_its_obligations
+          buzz-relay deleted_channel_discharges_the_obligation
+          buzz-relay ingested_event_discharges_its_dispatch_obligation
+          buzz-relay membership_lookup_failure_keeps_the_obligation
+          buzz-relay recovery_pass_discharges_a_left_obligation_once
+          buzz-relay repeated_dispatch_records_event_created_once
+          buzz-relay visibility_lookup_failure_keeps_the_obligation'
+          want=$(sort <<<"$expected")
+          count=$(grep -c '' <<<"$want")
+          tests=$(awk '{print "test(/::" $2 "$/)"}' <<<"$want" | paste -sd'|' - | sed 's/|/ or /g')
+          filter="kind(lib) and package(buzz-relay) and (${tests})"
+
+          cargo nextest list --archive-file "$archive" --run-ignored all \
+            -E "$filter" --message-format json > /tmp/dispatch-tests.json
+          selected=$(jq -r '."rust-suites"[] | ."binary-id" as $id | .testcases | to_entries[]
+            | select(.value."filter-match".status == "matches") | "\($id) \(.key)"' /tmp/dispatch-tests.json | sort)
+          echo "$selected"
+          got=$(awk '{n = split($2, path, "::"); print $1, path[n]}' <<<"$selected" | sort)
+          if [ "$got" != "$want" ]; then
+            echo "selected dispatch tests differ from the expected inventory:" >&2
+            diff <(echo "$want") <(echo "$got") >&2 || true
+            exit 1
+          fi
+
+          # A test that cannot reach either service prints "skipping" and passes.
+          (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null || { echo "Postgres is not accepting connections on 127.0.0.1:5432" >&2; exit 1; }
+          pong=''
+          exec 3<>/dev/tcp/127.0.0.1/6379
+          printf 'PING\r\n' >&3
+          read -r -t 5 pong <&3 || true
+          exec 3>&-
+          if [ "${pong%$'\r'}" != "+PONG" ]; then
+            echo "Redis did not answer PING on 127.0.0.1:6379: ${pong:-no reply}" >&2
+            exit 1
+          fi
+
+          cargo nextest run --archive-file "$archive" --run-ignored all \
+            -E "$filter" --no-capture --color never 2>&1 | tee /tmp/dispatch-tests.log
+          if grep -nE 'skipping .*(Postgres|Redis).*unavailable' /tmp/dispatch-tests.log; then
+            echo "a dispatch relay test skipped instead of running" >&2
+            exit 1
+          fi
+          if ! grep -qE "Summary .* ${count} tests? run: ${count} passed" /tmp/dispatch-tests.log; then
+            echo "expected ${count} dispatch relay tests to run and pass" >&2
+            exit 1
+          fi
       - name: Git default-branch route and clone regressions
         env:
           # The preceding step already applied and reconciled schema/schema.sql.
