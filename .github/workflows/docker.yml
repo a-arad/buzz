@@ -415,7 +415,7 @@ jobs:
 
       - name: Attest provenance for the merged image
         # Sigstore-signed in-toto attestation, verifiable with:
-        #   gh attestation verify oci://ghcr.io/block/buzz:<tag> --owner block
+        #   gh attestation verify oci://<image>@<digest> --owner <repository-owner>
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-name: ${{ env.IMAGE_NAME }}
@@ -488,7 +488,7 @@ jobs:
               echo
               echo "Verify deployment eligibility:"
               echo '```'
-              echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --repo block/buzz --signer-workflow block/buzz/.github/workflows/docker.yml --predicate-type https://buzz.block.xyz/attestations/deployment-eligibility/v1 --source-digest ${SOURCE_SHA}"
+              echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/docker.yml --predicate-type https://buzz.block.xyz/attestations/deployment-eligibility/v1 --source-digest ${SOURCE_SHA}"
               echo '```'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
