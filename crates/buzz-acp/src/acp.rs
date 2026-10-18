@@ -181,6 +181,10 @@ pub struct AcpClient {
     observer_agent_index: Option<usize>,
     /// Best-effort context attached to raw ACP wire events.
     observer_context: ObserverContext,
+    /// Origin of the current attention task, independent of native session identity.
+    attention_context: Option<serde_json::Value>,
+    attention_prompt: Option<String>,
+    attention_prepared: bool,
     /// Most recently observed `_meta.goose.activeRunId` from a
     /// `session/update` notification of kind `session_info_update`.
     ///
@@ -633,6 +637,9 @@ impl AcpClient {
             observer: None,
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
+            attention_context: None,
+            attention_prompt: None,
+            attention_prepared: false,
             active_run_id: None,
             steering_supported: false,
             recovery_supported: false,
@@ -912,9 +919,10 @@ impl AcpClient {
         idle_timeout: std::time::Duration,
         max_duration: std::time::Duration,
     ) -> Result<StopReason, AcpError> {
-        let mut params = build_prompt_params(session_id, prompt_blocks);
+        self.prepare_attention().await;
+        let mut params = self.prompt_params(session_id, prompt_blocks);
         if let Some(attempt) = self.recovery_attempt.take() {
-            params["_meta"] = serde_json::json!({"axesRecovery": {"attempt": attempt}});
+            params["_meta"]["axesRecovery"] = serde_json::json!({"attempt": attempt});
         }
         self.prompt_request(
             "session/prompt",
@@ -939,6 +947,34 @@ impl AcpClient {
     /// Bind the next prompt to its durable harness checkpoint.
     pub fn set_recovery_attempt(&mut self, attempt: String) {
         self.recovery_attempt = Some(attempt);
+    }
+
+    /// Set or clear the originating task before every turn, including reused workers.
+    pub fn set_attention_context(&mut self, context: Option<serde_json::Value>) {
+        self.attention_context = context;
+        self.attention_prompt = None;
+        self.attention_prepared = false;
+    }
+
+    pub(crate) async fn prepare_attention(&mut self) {
+        if !self.attention_prepared {
+            if let Some(context) = &self.attention_context {
+                self.attention_prompt = crate::attention::prompt(context).await;
+            }
+            self.attention_prepared = true;
+        }
+    }
+
+    pub(crate) fn prompt_params(&self, session: &str, blocks: &[&str]) -> serde_json::Value {
+        let mut blocks = blocks.to_vec();
+        if let Some(text) = &self.attention_prompt {
+            blocks.push(text);
+        }
+        let mut params = build_prompt_params(session, &blocks);
+        if let Some(context) = &self.attention_context {
+            params["_meta"]["axesAttentionContext"] = context.clone();
+        }
+        params
     }
 
     /// Resolve an accepted attempt using native evidence, without replaying its prompt.

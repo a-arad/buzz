@@ -10,19 +10,29 @@ use crate::validate::{parse_uuid, read_or_stdin, sdk_err, validate_uuid};
 // TODO(phase-4): Replace raw nostr::EventBuilder usage with buzz-sdk builder functions
 
 /// List workflows in a channel — query kind:30620 workflow definition events.
-pub async fn cmd_list_workflows(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
-    validate_uuid(channel_id)?;
-    let filter = serde_json::json!({
+pub async fn cmd_list_workflows(
+    client: &BuzzClient,
+    channel_id: Option<&str>,
+    owned: bool,
+) -> Result<(), CliError> {
+    let mut filter = serde_json::json!({
         "kinds": [30620],
-        "#h": [channel_id]
     });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    if let Some(channel_id) = channel_id {
+        validate_uuid(channel_id)?;
+        filter["#h"] = serde_json::json!([channel_id]);
+    }
+    if owned {
+        filter["authors"] = serde_json::json!([client.keys().public_key().to_hex()]);
+    }
+    let events = client.query_all(filter).await?;
     let workflows: Vec<serde_json::Value> = events
         .iter()
         .map(|e| {
             serde_json::json!({
                 "workflow_id": extract_d_tag(e),
+                "event_id": e.get("id"),
+                "channel_id": crate::client::extract_tag_value(e, "h"),
                 "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                 "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
                 "pubkey": e.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
@@ -46,6 +56,8 @@ pub async fn cmd_get_workflow(client: &BuzzClient, workflow_id: &str) -> Result<
     if let Some(e) = events.first() {
         let normalized = serde_json::json!({
             "workflow_id": extract_d_tag(e),
+            "event_id": e.get("id"),
+            "channel_id": crate::client::extract_tag_value(e, "h"),
             "content": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
             "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
             "pubkey": e.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
@@ -121,6 +133,7 @@ pub async fn cmd_update_workflow(
     channel_id: &str,
     workflow_id: &str,
     yaml: &str,
+    if_event: Option<&str>,
 ) -> Result<(), CliError> {
     let channel_uuid = parse_uuid(channel_id)?;
     let wf_uuid = parse_uuid(workflow_id)?;
@@ -137,10 +150,27 @@ pub async fn cmd_update_workflow(
         .and_then(|event| event.get("id"))
         .and_then(|id| id.as_str())
         .ok_or_else(|| CliError::NotFound(format!("workflow {workflow_id} not found")))?;
+    if let Some(reviewed) = if_event {
+        crate::validate::validate_hex64(reviewed)?;
+        if reviewed != expected_revision {
+            return Err(CliError::Conflict("workflow changed since review".into()));
+        }
+    }
 
     let builder =
         buzz_sdk::build_workflow_update(channel_uuid, wf_uuid, &yaml_definition, expected_revision)
             .map_err(sdk_err)?;
+    // NIP-33 replacements order by timestamp before event ID. A reviewed
+    // update in the same second must supersede its predecessor deterministically.
+    let previous_at = events
+        .first()
+        .and_then(|event| event["created_at"].as_u64())
+        .ok_or_else(|| CliError::Other("workflow head has no creation time".into()))?;
+    let builder = builder.custom_created_at(nostr::Timestamp::from_secs(
+        nostr::Timestamp::now()
+            .as_secs()
+            .max(previous_at.saturating_add(1)),
+    ));
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
@@ -227,7 +257,9 @@ pub async fn cmd_approve_step(
 pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(), CliError> {
     use crate::WorkflowsCmd;
     match cmd {
-        WorkflowsCmd::List { channel } => cmd_list_workflows(client, &channel).await,
+        WorkflowsCmd::List { channel, owned } => {
+            cmd_list_workflows(client, channel.as_deref(), owned).await
+        }
         WorkflowsCmd::Get { workflow } => cmd_get_workflow(client, &workflow).await,
         WorkflowsCmd::Create { channel, yaml } => {
             cmd_create_workflow(client, &channel, &yaml).await
@@ -236,7 +268,8 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             channel,
             workflow,
             yaml,
-        } => cmd_update_workflow(client, &channel, &workflow, &yaml).await,
+            if_event,
+        } => cmd_update_workflow(client, &channel, &workflow, &yaml, if_event.as_deref()).await,
         WorkflowsCmd::Delete { workflow } => cmd_delete_workflow(client, &workflow).await,
         WorkflowsCmd::Trigger { workflow, inputs } => {
             cmd_trigger_workflow(client, &workflow, inputs.as_deref()).await

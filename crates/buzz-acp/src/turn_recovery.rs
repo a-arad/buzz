@@ -57,11 +57,12 @@ impl SessionState {
     }
 }
 
-pub(crate) fn begin(
+pub(crate) async fn begin(
     agent: &mut OwnedAgent,
     mut pending: Pending,
     blocks: &[&str],
 ) -> Result<(), AcpError> {
+    agent.acp.prepare_attention().await;
     if !agent.acp.recovery_supported() {
         return Ok(());
     }
@@ -71,8 +72,8 @@ pub(crate) fn begin(
         ));
     }
     if agent.acp.accepts_before_preparation() {
-        let mut request = crate::acp::build_prompt_params(&pending.session, blocks);
-        request["_meta"] = serde_json::json!({"axesRecovery": {"attempt": pending.attempt}});
+        let mut request = agent.acp.prompt_params(&pending.session, blocks);
+        request["_meta"]["axesRecovery"] = serde_json::json!({"attempt": pending.attempt});
         pending.request = Some(request);
     }
     agent.acp.set_recovery_attempt(pending.attempt.clone());

@@ -989,8 +989,11 @@ pub enum WorkflowsCmd {
     /// List workflows in a channel
     List {
         /// Channel UUID
+        #[arg(long, required_unless_present = "owned")]
+        channel: Option<String>,
+        /// Include this identity's workflows across all accessible channels.
         #[arg(long)]
-        channel: String,
+        owned: bool,
     },
     /// Get details for a single workflow
     Get {
@@ -1018,6 +1021,9 @@ pub enum WorkflowsCmd {
         /// Updated workflow YAML definition
         #[arg(long)]
         yaml: String,
+        /// Revision reviewed by the caller; reject concurrent changes.
+        #[arg(long)]
+        if_event: Option<String>,
     },
     /// Delete a workflow
     Delete {

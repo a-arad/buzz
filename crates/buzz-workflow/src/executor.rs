@@ -420,10 +420,12 @@ pub fn resolve_step_templates(
             text,
             channel,
             reply_in_thread,
+            thread_root,
         } => Ok(SendMessage {
             text: t(text)?,
             channel: t_opt(channel)?,
             reply_in_thread: *reply_in_thread,
+            thread_root: thread_root.clone(),
         }),
         SendDm { to, text } => Ok(SendDm {
             to: t(to)?,
@@ -570,6 +572,7 @@ pub async fn dispatch_action(
                     text,
                     channel,
                     reply_in_thread,
+                    thread_root,
                 } => {
                     // Look up workflow metadata for destination validation and
                     // attribution, scoped to the run's community — the same run/workflow
@@ -613,7 +616,7 @@ pub async fn dispatch_action(
                         }
                         Some(trigger_ctx.message_id.as_str())
                     } else {
-                        None
+                        thread_root.as_deref()
                     };
 
                     info!(
@@ -1476,6 +1479,7 @@ mod tests {
                 text: "hi {{trigger.author}}".to_owned(),
                 channel: None,
                 reply_in_thread: true,
+                thread_root: None,
             },
         };
         let resolved = resolve_step_templates(&step, &ctx, &HashMap::new()).unwrap();

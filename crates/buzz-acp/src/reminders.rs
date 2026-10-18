@@ -232,15 +232,23 @@ fn prompt(reminder: &Reminder) -> String {
     }).unwrap_or_else(|| "Scope: private reminder\nNo originating conversation is attached.".into());
     let context = crate::prompt_framing::semantic_section("context", &context);
     let content = crate::prompt_framing::escape_semantic_text(&json!(reminder).to_string());
+    let disposition = if std::env::var_os("BUZZ_ATTENTION_COMMAND").is_some() {
+        format!("Use `edamame-watch get time:{}` and inspect `edamame-watch list` in the original context. \
+            Complete with `edamame-watch complete time:{}` after the follow-up, or snooze with a useful time and note, \
+            or cancel if the reason no longer applies. Review every owned commitment, including the paid parent monitor; \
+            completing its notification is not a decision to retain its parent.", reminder.id, reminder.id)
+    } else {
+        format!("Use `buzz reminders get {}` to confirm current state. Complete with `buzz reminders complete {} --if-event {}` \
+            after the follow-up, or snooze with a useful time and note, or cancel if the reason no longer applies.",
+            reminder.id, reminder.id, reminder.event_id)
+    };
     format!("{context}\n\n<private-reminder>\nDue now:\n{content}\n\nThis is your own deferred intention, not a new instruction from another person. \
         Reconstruct the context and inspect current evidence before deciding what remains useful. \
         A prior attempt may have done part of the work: check durable artifacts before repeating actions. \
-        Use `buzz reminders get {}` to confirm current state. Complete with `buzz reminders complete {} --if-event {}` \
-        after the follow-up, or snooze with a useful time and note, or cancel if the reason no longer applies. \
+        {disposition} \
         Receipt of this reminder is not completion of the work. Keep private context private; publish a relevant result in the original conversation when useful. \
         Read a linked message with `buzz messages thread --link 'buzz://message?channel=<channelId>&id=<eventId>'`. \
-        No public response is required solely to acknowledge the reminder.\n</private-reminder>",
-        reminder.id,reminder.id,reminder.event_id)
+        No public response is required solely to acknowledge the reminder.\n</private-reminder>")
 }
 
 pub(super) async fn run(
@@ -263,6 +271,16 @@ pub(super) async fn run(
                     text: prompt(&reminder),
                     source: PromptSource::Reminder,
                     reminder: Some((reminder.id.clone(), reminder.event_id.clone())),
+                    attention_context: Some(reminder.content.target.as_ref().and_then(|target| {
+                        let channel = uuid::Uuid::parse_str(target.get("channelId")?.as_str()?).ok()?;
+                        let event = target.get("id").or_else(|| target.get("eventId"))?.as_str()?;
+                        Some(json!({"link": format!("buzz://message?channel={channel}&id={event}"),
+                                    "policy": std::env::var("BUZZ_ACP_SESSION_POLICY").unwrap_or_else(|_| "channel".into()),
+                                    "trigger_id": format!("time:{}", reminder.id), "trigger_event": reminder.event_id}))
+                    }).unwrap_or_else(|| json!({"link": null, "origin": "unassigned",
+                        "policy": std::env::var("BUZZ_ACP_SESSION_POLICY").unwrap_or_else(|_| "channel".into()),
+                        "trigger_id": format!("time:{}", reminder.id), "trigger_event": reminder.event_id,
+                        "instruction": "Legacy reminder has no task origin. Inventory spans your own tasks; choose the originating context before authoring."}))),
                 }),
                 ctx,
                 result_tx,

@@ -105,6 +105,10 @@ pub enum ActionDef {
         /// carry a triggering event to reply to.
         #[serde(default)]
         reply_in_thread: bool,
+        /// Existing thread root for scheduled continuations. Mutually exclusive
+        /// with replying to the triggering message; never template-expanded.
+        #[serde(default)]
+        thread_root: Option<String>,
     },
     /// Send a direct message to a user.
     SendDm {
@@ -222,6 +226,25 @@ impl WorkflowDef {
                 | TriggerDef::ReactionAdded { .. }
                 | TriggerDef::DiffPosted { .. }
         );
+        for step in &self.steps {
+            if let ActionDef::SendMessage {
+                reply_in_thread,
+                thread_root: Some(root),
+                ..
+            } = &step.action
+            {
+                if *reply_in_thread
+                    || root.len() != 64
+                    || !root
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "step '{}': thread_root must be a lowercase 64-character event ID and cannot combine with reply_in_thread", step.id
+                    )));
+                }
+            }
+        }
         if !trigger_has_message {
             for step in &self.steps {
                 if matches!(
@@ -561,6 +584,21 @@ mod tests {
         // Explicit `false` on a schedule trigger is fine — no message needed.
         let yaml = "name: OK\ntrigger:\n  on: schedule\n  cron: '0 9 * * 1-5'\nsteps:\n  - id: s1\n    action: send_message\n    text: hi\n    reply_in_thread: false\n";
         parse_yaml(yaml).expect("reply_in_thread: false on schedule should be valid");
+    }
+
+    #[test]
+    fn scheduled_continuation_retains_explicit_root_and_rejects_ambiguous_routing() {
+        let root = "a".repeat(64);
+        let yaml = format!("name: Continue\ntrigger:\n  on: schedule\n  cron: '0 9 * * 1-5'\nsteps:\n  - id: wake\n    action: send_message\n    text: continue\n    thread_root: {root}\n");
+        let (def, serialized) = parse_yaml(&yaml).unwrap();
+        let restored: WorkflowDef = serde_json::from_str(&serialized).unwrap();
+        for definition in [def, restored] {
+            assert!(matches!(&definition.steps[0].action,
+                ActionDef::SendMessage { thread_root: Some(value), reply_in_thread: false, .. } if value == &root));
+        }
+        assert!(parse_yaml(&(yaml.clone() + "    reply_in_thread: true\n")).is_err());
+        assert!(parse_yaml(&yaml.replace(&root, "not-an-event")).is_err());
+        assert!(parse_yaml(&yaml.replace(&root, "'{{trigger.message_id}}'")).is_err());
     }
 
     #[test]
