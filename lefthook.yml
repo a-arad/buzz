@@ -1,7 +1,8 @@
 # Glob patterns below mirror the `changes` job's dorny/paths-filter groups in
 # .github/workflows/ci.yml — keep the two in sync. Each globbed pre-push lane
-# also sets `files: git diff --name-only origin/main...HEAD` so its file set is
-# the branch's merge-base diff against origin/main — the same semantics as CI's
+# also sets `files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"` so its file set is
+# the branch's merge-base diff against origin/main (or CHECK_FILE_SIZES_BASE
+# for a fork/release target) — the same semantics as CI's
 # dorny/paths-filter and `scripts/check-file-sizes-core.mjs` `resolveBaseRef`.
 # Without it lefthook derives files from `git diff HEAD @{push}`, which after a
 # rebase or `git merge origin/main` includes everything main changed since the
@@ -98,7 +99,7 @@ pre-push:
       # would only duplicate policy and create another place for coverage drift.
       run: ./scripts/without-git-env.sh just file-size-check
     rust-tests:
-      files: git diff --name-only origin/main...HEAD
+      files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"
       glob: ["crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "Justfile"]
       env:
         # Lanes run under a pty; with agent shells' TERM=dumb, nextest's
@@ -108,7 +109,7 @@ pre-push:
         NEXTEST_NO_INPUT_HANDLER: "1"
       run: ./scripts/without-git-env.sh just test-unit
     desktop-check:
-      files: git diff --name-only origin/main...HEAD
+      files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"
       glob: ["desktop/**", "pnpm-lock.yaml", "Justfile"]
       exclude: ["desktop/src-tauri/**"]
       env: &pnpm-verify-deps
@@ -120,13 +121,13 @@ pre-push:
         pnpm_config_verify_deps_before_run: warn
       run: ./scripts/without-git-env.sh just desktop-check
     desktop-typecheck:
-      files: git diff --name-only origin/main...HEAD
+      files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"
       glob: ["desktop/**", "pnpm-lock.yaml", "Justfile"]
       exclude: ["desktop/src-tauri/**"]
       env: *pnpm-verify-deps
       run: ./scripts/without-git-env.sh just desktop-typecheck
     desktop-test:
-      files: git diff --name-only origin/main...HEAD
+      files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"
       glob: ["desktop/**", "pnpm-lock.yaml", "Justfile"]
       exclude: ["desktop/src-tauri/**"]
       env: *pnpm-verify-deps
@@ -135,12 +136,12 @@ pre-push:
       # Keep local lint parity with Desktop Tauri CI for every path that can
       # affect the Tauri crate or its path dependencies. Run clippy and tests
       # serially so parallel pre-push hooks do not contend for Cargo's lock.
-      files: git diff --name-only origin/main...HEAD
+      files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"
       glob: ["desktop/src-tauri/**", "crates/**", "migrations/**", "schema/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml", "scripts/run-tests.sh", "Justfile"]
       run: ./scripts/without-git-env.sh sh -c 'just desktop-tauri-clippy && just desktop-tauri-test'
     mobile-checks:
       # Run analysis and tests serially so parallel pre-push hooks do not
       # contend for shared Flutter state (.dart_tool, shader bundle).
-      files: git diff --name-only origin/main...HEAD
+      files: git diff --name-only "${CHECK_FILE_SIZES_BASE:-origin/main}...HEAD"
       glob: ["mobile/**"]
       run: ./scripts/without-git-env.sh sh -c 'just mobile-check && just mobile-test'

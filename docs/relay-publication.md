@@ -30,3 +30,16 @@ The initial agent-DM release source is
 `cc8ce0ee6bd9502e287fb7e93b039741ae2214dc` on
 `codex/agent-dm-policy-relay-v0.2.1`. The retained Git bundle remains a recovery
 copy; ordinary Git access can now retrieve this branch.
+
+## Fork CI prerequisites
+
+The normal relay workflow defaults relay and push-gateway image/cache names to
+this repository’s GHCR namespace. `GHCR_IMAGE` and `GHCR_PUSH_GATEWAY_IMAGE`
+repository variables override those destinations without broadening token access.
+External pull requests still cannot export caches.
+
+When pushing a fork or stable-line branch, set `CHECK_BRANCH_SKEW_REMOTE` and
+`CHECK_BRANCH_SKEW_BRANCH` to its actual remote and PR base. Set
+`CHECK_FILE_SIZES_BASE` to that remote-tracking base as well; both the size ratchet
+and scoped pre-push lanes use it. This avoids testing unrelated upstream changes
+and retains checks for every file changed against the actual target.
