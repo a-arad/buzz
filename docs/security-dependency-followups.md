@@ -1,7 +1,8 @@
 # Dependency migration follow-ups
 
-These open items track the two exact unmaintained-notice exceptions in
-`deny.toml`. They do not suppress vulnerability advisories. The repository
+These open items track the exact advisory exceptions in `deny.toml`.
+DEP-001 and DEP-002 are unmaintained notices. DEP-003 covers vulnerability
+advisories, limited to test builds; see its reachability evidence. The repository
 `a-arad/buzz` has issues disabled, so this versioned tracker and
 [PR #15](https://github.com/a-arad/buzz/pull/15) retain the work instead of
 silently dropping it. Owner: codex-arad under Arad's maintenance delegation.
@@ -63,6 +64,43 @@ Completion criteria:
   already recorded intermittent mesh timeout separate from new failures.
 - Confirm pool removal in both root and desktop dependency graphs, remove
   the exact exception, and pass dependency policy before closing DEP-002.
+
+## DEP-003: zip 9 via mesh-llm
+
+**Status: open.** Owner: claude-arad.
+[RUSTSEC-2026-0367](https://rustsec.org/advisories/RUSTSEC-2026-0367.html),
+[0368](https://rustsec.org/advisories/RUSTSEC-2026-0368.html) and
+[0369](https://rustsec.org/advisories/RUSTSEC-2026-0369.html) are
+vulnerabilities in zip's extraction: privileged mode bits preserved, and
+symlinks created or followed outside the destination. All three are patched
+only in zip 9.0.0, which is semver-incompatible with the lock.
+
+The only root path is `buzz-relay [dev] → mesh-llm 0.74.0
+(mesh-llm-host-runtime, -plugin-manager, -system) → zip ^2`, locked at
+2.4.2. No root workspace crate depends on zip. `cargo tree --locked
+-e normal,build` for every root member on `x86_64-unknown-linux-gnu` and
+`aarch64-apple-darwin`, and for the image set
+`-p buzz-relay -p buzz-admin -p buzz-pair-relay`, finds no zip path, so zip
+is compiled into no shipped artifact. The latest mesh-llm tag checked,
+v0.78.1, still locks zip 8.6.0.
+
+At the pinned tag, mesh-llm extracts ZIP archives in
+`mesh-llm-system/src/autoupdate/release_fetch.rs::extract_zip_archive` and
+`mesh-llm-plugin-manager/src/archive.rs::extract_zip`. Both iterate entries
+with `by_index`, reject paths without `enclosed_name`, and write regular
+files with `File::create` and `io::copy`. Neither calls `extract()`, reads
+`unix_mode`, or creates symlinks. That is why the exception is limited to
+test builds; it is not a claim that zip 2.4 is safe for other callers.
+
+Completion criteria:
+
+- Adopt a mesh-llm release that uses zip ≥ 9 (or drops zip), run the full
+  relay package and mesh lifecycle tests, remove the three exact IDs, and
+  pass `cargo-deny check`.
+- Until then, at each mesh-llm pin change, re-run the reachability check
+  above and re-read the mesh ZIP call sites; drop the exception if either
+  claim stops holding.
+- The desktop graph locks zip separately and is not covered here.
 
 **Separate desktop security follow-up, still open:**
 `desktop/src-tauri/Cargo.lock` remains at rustls 0.23.42 and webbrowser 1.2.1.

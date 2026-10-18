@@ -12,6 +12,12 @@ ignore = [
     { id = "RUSTSEC-2024-0449", reason = "serde_yaml has no patch replacing unsafe-libyaml; member-authored workflow YAML is production reachable; migrate under DEP-001, review by 2026-10-23" },
     # docs/security-dependency-followups.md#dep-002-migrate-mesh-nostr-and-desktop-lock
     { id = "RUSTSEC-2026-0243", reason = "relay dev-only mesh-llm 0.74 pins nostr-sdk 0.44; standalone pool removal requires SDK migration; DEP-002, review by 2026-10-23" },
+    # Vulnerability advisories in test builds only: zip is compiled into no
+    # shipped artifact, and mesh-llm never calls the affected extract() APIs.
+    # docs/security-dependency-followups.md#dep-003-zip-9-via-mesh-llm
+    { id = "RUSTSEC-2026-0367", reason = "zip 2.4 dev-only via buzz-relay [dev] -> mesh-llm 0.74.0 (^2); fix needs zip 9; mesh extracts without unix modes; DEP-003, review by 2026-10-23" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 2.4 dev-only via buzz-relay [dev] -> mesh-llm 0.74.0 (^2); fix needs zip 9; ZipArchive::extract unused; DEP-003, review by 2026-10-23" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 2.4 dev-only via buzz-relay [dev] -> mesh-llm 0.74.0 (^2); fix needs zip 9; extract() unused, no symlinks; DEP-003, review by 2026-10-23" },
     # quick-xml < 0.41: quadratic runtime on duplicate-attribute check (0194) and
     # unbounded namespace-declaration allocation in NsReader (0195). Both DoS-class,
     # requiring attacker-controlled XML. Our two locked versions only parse trusted
