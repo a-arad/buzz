@@ -1,10 +1,13 @@
 //! App-owned follow-up work for a newly inserted `events` row.
 //!
-//! Two pieces of work follow every durable event insert:
+//! Three pieces of work follow a durable event insert:
 //!
 //! - **Push match enqueue.** Push-eligible kinds get a `push_match_queue` row
 //!   when the community has an eligible lease. This runs right after the
 //!   INSERT, in the same transaction, and any failure rejects the event.
+//! - **Dispatch obligation.** An insert running inside a matching
+//!   [`DispatchObligation`](crate::event_dispatch::DispatchObligation) scope gets
+//!   an `event_dispatch_queue` row in the same transaction.
 //! - **Channel TTL refresh.** A channel-scoped event pushes its ephemeral
 //!   channel's `ttl_deadline` forward. [`AdmittedTx`] records the channel and
 //!   runs the refresh as the last statement before COMMIT (see
@@ -52,6 +55,8 @@ pub(crate) async fn after_admitted_insert(
 ) -> Result<()> {
     let community = tx.community();
     enqueue_push_match(tx.conn(), community, event_id, kind).await?;
+    crate::store::event_dispatch::enqueue_for_admitted_insert(tx.conn(), community, event_id)
+        .await?;
     tx.record_channel_event(channel_id, kind);
     Ok(())
 }

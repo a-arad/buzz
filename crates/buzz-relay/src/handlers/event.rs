@@ -361,6 +361,30 @@ pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pub
     }
 }
 
+/// How a dispatch pass gets the event's `event_created` audit entry recorded.
+pub(crate) enum AuditStep {
+    /// Queue the entry now and wait for it to be recorded.
+    Enqueue,
+    /// The caller already queued it; wait on its receipt. `None` when no
+    /// entry is owed (audit disabled, or a caller that writes none).
+    Enqueued(Option<tokio::sync::oneshot::Receiver<bool>>),
+}
+
+/// How long a dispatch pass waits for its audit entry to be recorded before
+/// counting the audit step as failed. The queued entry is still written; the
+/// next pass finds it recorded.
+const AUDIT_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Result of one post-commit dispatch pass.
+#[derive(Debug)]
+pub(crate) struct DispatchOutcome {
+    /// Local subscriptions the event was sent to.
+    pub(crate) recipients: usize,
+    /// The first effect that did not complete, if any. A pass with a failure
+    /// leaves the event's dispatch obligation for the recovery worker.
+    pub(crate) failure: Option<&'static str>,
+}
+
 /// Schedule post-commit delivery/side effects for a stored event.
 ///
 /// This intentionally returns after only the bounded audit enqueue has completed:
@@ -370,6 +394,12 @@ pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pub
 /// audit DB is overloaded; the spawned task still runs the same guarded fan-out
 /// path, Redis publish, `mark_local_event` echo dedupe, and delivery metrics as
 /// the former inline path.
+///
+/// An event stored under a dispatch obligation (`event_dispatch_queue`) keeps
+/// it until the spawned pass finishes every effect: the audit entry recorded,
+/// Redis publish, local fan-out and workflow runs started. A pass that stops
+/// short, or a crash, leaves the obligation for
+/// [`crate::dispatch_recovery`], which runs the dispatch again.
 pub(crate) async fn dispatch_persistent_event(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -379,7 +409,7 @@ pub(crate) async fn dispatch_persistent_event(
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
 ) -> usize {
     let event_id_hex = stored_event.event.id.to_hex();
-    enqueue_event_created_audit(
+    let audit_recorded = enqueue_event_created_audit(
         tenant,
         state,
         stored_event,
@@ -396,36 +426,70 @@ pub(crate) async fn dispatch_persistent_event(
 
     metrics::counter!("buzz_post_commit_dispatch_scheduled_total").increment(1);
     tokio::spawn(async move {
-        let recipients = dispatch_persistent_event_inner(
+        let outcome = dispatch_persistent_event_inner(
             &tenant,
             &state,
             &stored_event,
             kind_u32,
             &actor_pubkey_hex,
-            false,
+            AuditStep::Enqueued(audit_recorded),
             threaded_visibility,
+            false,
         )
         .await;
-        debug!(
-            event_id = %event_id_hex,
-            recipients,
-            "post-commit dispatch complete"
-        );
+        match outcome.failure {
+            None => {
+                // Discharge the obligation, if this event has one. A failed
+                // delete leaves it to the recovery worker, whose pass finds
+                // every effect already done.
+                if let Err(e) = state
+                    .db
+                    .complete_dispatch(
+                        tenant.community(),
+                        &[stored_event.event.id.as_bytes().to_vec()],
+                    )
+                    .await
+                {
+                    warn!(event_id = %event_id_hex, "dispatch obligation delete failed: {e}");
+                }
+                debug!(
+                    event_id = %event_id_hex,
+                    recipients = outcome.recipients,
+                    "post-commit dispatch complete"
+                );
+            }
+            Some(stage) => {
+                metrics::counter!("buzz_post_commit_dispatch_incomplete_total", "stage" => stage)
+                    .increment(1);
+                warn!(
+                    event_id = %event_id_hex,
+                    stage,
+                    "post-commit dispatch incomplete; obligation left for recovery"
+                );
+            }
+        }
     });
 
     0
 }
 
 /// Run post-commit delivery/side effects for a stored event.
-async fn dispatch_persistent_event_inner(
+///
+/// Safe to run more than once for one event: the audit entry is recorded once,
+/// workflow runs start once per (workflow, event), and a repeated publish or
+/// fan-out only resends an event clients deduplicate by id. `recovered` selects
+/// [`buzz_workflow::WorkflowEngine::on_recovered_event`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_persistent_event_inner(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     stored_event: &StoredEvent,
     kind_u32: u32,
     actor_pubkey_hex: &str,
-    enqueue_audit: bool,
+    audit: AuditStep,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
-) -> usize {
+    recovered: bool,
+) -> DispatchOutcome {
     // No `crate::conformance` emit here — the spec doesn't have a
     // separate fan-out action. Acceptance was already recorded at the
     // ingest seam (`crates/buzz-relay/src/handlers/ingest.rs`'s
@@ -433,6 +497,7 @@ async fn dispatch_persistent_event_inner(
     // surfaces as `ReadMessageRows` observations on the subscriber side
     // (read seam in req.rs, emitted by the held-back read-seam diff).
     let event_id_hex = stored_event.event.id.to_hex();
+    let mut failure = None;
 
     let topic = match stored_event.channel_id {
         Some(channel_id) => EventTopic::Channel(channel_id),
@@ -450,6 +515,7 @@ async fn dispatch_persistent_event_inner(
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
         warn!(event_id = %event_id_hex, "Redis publish failed: {e}");
+        failure = Some("publish");
     }
 
     let matches = state
@@ -477,7 +543,10 @@ async fn dispatch_persistent_event_inner(
             error!(event_id = %event_id_hex, "Failed to serialize event for fan-out: {e}");
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
-            return 0;
+            return DispatchOutcome {
+                recipients: 0,
+                failure: Some("serialize"),
+            };
         }
     };
     let recipients: Vec<_> = matches
@@ -500,17 +569,20 @@ async fn dispatch_persistent_event_inner(
     // out-of-band index to feed. The old Typesense `index_event` worker and its
     // `search_index_tx` mpsc are gone with the Typesense backend.
 
-    if enqueue_audit {
-        enqueue_event_created_audit(
-            tenant,
-            state,
-            stored_event,
-            kind_u32,
-            actor_pubkey_hex,
-            &event_id_hex,
-        )
-        .await;
-    }
+    let audit_recorded = match audit {
+        AuditStep::Enqueue => {
+            enqueue_event_created_audit(
+                tenant,
+                state,
+                stored_event,
+                kind_u32,
+                actor_pubkey_hex,
+                &event_id_hex,
+            )
+            .await
+        }
+        AuditStep::Enqueued(receipt) => receipt,
+    };
 
     // Skip workflow triggering for workflow-execution kinds and relay-signed workflow messages.
     let is_relay_workflow_msg = stored_event.event.pubkey == state.relay_keypair.public_key()
@@ -525,36 +597,57 @@ async fn dispatch_persistent_event_inner(
         && !is_relay_workflow_msg
         && kind_u32 != KIND_GIFT_WRAP
     {
-        let workflow_engine = Arc::clone(&state.workflow_engine);
-        let workflow_event = stored_event.clone();
-        let trigger_kind = kind_u32.to_string();
-        let workflow_community_host = tenant.host().to_owned();
         // The event was stored under `tenant.community()`; `StoredEvent` does
         // not carry the community, so pass it explicitly. The same channel UUID
         // can exist in another community — scoping the workflow lookup to this
         // community keeps a colliding channel id in B from triggering A's
         // workflows.
         let workflow_community = tenant.community();
-        tokio::spawn(async move {
-            if let Err(e) = workflow_engine
-                .on_event(workflow_community, &workflow_event)
+        let triggered = if recovered {
+            state
+                .workflow_engine
+                .on_recovered_event(workflow_community, stored_event)
                 .await
-            {
-                tracing::error!(event_id = ?workflow_event.event.id, "Workflow trigger failed: {e}");
-            } else {
-                metrics::counter!(
-                    "buzz_workflow_runs_total",
-                    "trigger" => trigger_kind,
-                    "community" => workflow_community_host
-                )
-                .increment(1);
+        } else {
+            state
+                .workflow_engine
+                .on_event(workflow_community, stored_event)
+                .await
+        };
+        match triggered {
+            Ok(()) => metrics::counter!(
+                "buzz_workflow_runs_total",
+                "trigger" => kind_u32.to_string(),
+                "community" => tenant.host().to_owned()
+            )
+            .increment(1),
+            Err(e) => {
+                tracing::error!(event_id = ?stored_event.event.id, "Workflow trigger failed: {e}");
+                failure = failure.or(Some("workflow"));
             }
-        });
+        }
     }
 
-    matches.len()
+    if let Some(receipt) = audit_recorded {
+        let recorded = matches!(
+            tokio::time::timeout(AUDIT_RECEIPT_TIMEOUT, receipt).await,
+            Ok(Ok(true))
+        );
+        if !recorded {
+            warn!(event_id = %event_id_hex, "event_created audit entry not recorded");
+            failure = failure.or(Some("audit"));
+        }
+    }
+
+    DispatchOutcome {
+        recipients: matches.len(),
+        failure,
+    }
 }
 
+/// Queue the event's `event_created` audit entry, to be recorded at most once.
+/// Returns the receipt the audit worker answers once the entry is in the chain,
+/// or `None` when audit logging is disabled.
 async fn enqueue_event_created_audit(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -562,17 +655,15 @@ async fn enqueue_event_created_audit(
     kind_u32: u32,
     actor_pubkey_hex: &str,
     event_id_hex: &str,
-) {
-    let Some(audit_tx) = &state.audit_tx else {
-        return;
-    };
+) -> Option<tokio::sync::oneshot::Receiver<bool>> {
+    let audit_tx = state.audit_tx.as_ref()?;
     // Audit via bounded channel (capacity 1000). Uses .send().await so entries
     // are never silently dropped — backpressure propagates to the event handler
     // if the queue is full. This is intentional: the audit advisory lock already
     // serializes writes (at most 1 in-flight), so a full queue means the audit
     // DB is genuinely overloaded and the relay should slow down rather than
-    // accumulate unbounded in-memory state. DB write failures in the worker are
-    // logged but not retried (same as the previous per-event tokio::spawn).
+    // accumulate unbounded in-memory state. A failed write answers the receipt
+    // with `false`, which keeps the event's dispatch obligation for a retry.
     let audit_entry = buzz_audit::NewAuditEntry {
         community_id: tenant.community(),
         action: buzz_audit::AuditAction::EventCreated,
@@ -589,10 +680,18 @@ async fn enqueue_event_created_audit(
             "channel_id": stored_event.channel_id,
         }),
     };
-    if let Err(e) = audit_tx.send(audit_entry).await {
+    let (recorded, receipt) = tokio::sync::oneshot::channel();
+    if let Err(e) = audit_tx
+        .send(crate::state::AuditJob::EventCreated {
+            entry: audit_entry,
+            recorded,
+        })
+        .await
+    {
         error!(event_id = %event_id_hex, "Audit channel closed — entry lost: {e}");
         metrics::counter!("buzz_audit_send_errors_total").increment(1);
     }
+    Some(receipt)
 }
 
 /// Handle an EVENT message from a WebSocket connection.
@@ -2133,8 +2232,9 @@ mod tests {
                         &buzz_core::StoredEvent::new(event, None),
                         kind,
                         &author,
-                        false,
+                        super::super::AuditStep::Enqueued(None),
                         None,
+                        false,
                     )
                     .await;
                 }
@@ -2429,8 +2529,9 @@ mod tests {
                 &stored,
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
-                true,
+                super::super::AuditStep::Enqueue,
                 None,
+                false,
             )
             .await;
 
@@ -2531,8 +2632,9 @@ mod tests {
                 &a_stored,
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
-                true,
+                super::super::AuditStep::Enqueue,
                 None,
+                false,
             )
             .await;
             super::super::dispatch_persistent_event_inner(
@@ -2541,8 +2643,9 @@ mod tests {
                 &b_stored,
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
-                true,
+                super::super::AuditStep::Enqueue,
                 None,
+                false,
             )
             .await;
 

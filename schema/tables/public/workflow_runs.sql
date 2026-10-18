@@ -21,3 +21,7 @@ CREATE TABLE workflow_runs (
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+-- At most one run per (workflow, triggering event); see migration 0058.
+CREATE UNIQUE INDEX idx_workflow_runs_trigger_event
+    ON workflow_runs (community_id, trigger_event_id, workflow_id)
+    WHERE trigger_event_id IS NOT NULL;

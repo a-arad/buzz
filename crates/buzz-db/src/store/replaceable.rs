@@ -342,6 +342,12 @@ async fn replace_parameterized_event_in_transaction_impl(
             kind_i32,
         )
         .await?;
+        crate::store::event_dispatch::enqueue_for_admitted_insert(
+            tx.conn(),
+            community_id,
+            incoming_id,
+        )
+        .await?;
 
         if is_nip_rs {
             sqlx::query(

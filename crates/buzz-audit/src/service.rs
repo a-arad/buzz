@@ -29,6 +29,31 @@ fn log_timestamp() -> DateTime<Utc> {
 /// taken with `pg_advisory_lock(hashtextextended(...))` — see [`AuditService::log`].
 const AUDIT_LOCK_NAMESPACE: &str = "buzz_audit:";
 
+/// Take the per-community chain lock: hash the namespaced community id to an
+/// i64 lock key inside Postgres, so communities lock independently. Advisory
+/// locks are session-scoped; release with [`unlock_community_chain`].
+async fn lock_community_chain(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    community_id: CommunityId,
+) -> Result<String, AuditError> {
+    let lock_key = format!("{AUDIT_LOCK_NAMESPACE}{community_id}");
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(&lock_key)
+        .execute(&mut **conn)
+        .await?;
+    Ok(lock_key)
+}
+
+async fn unlock_community_chain(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
+    lock_key: &str,
+) {
+    let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(&mut **conn)
+        .await;
+}
+
 /// Append-only, per-community hash-chain audit log backed by Postgres.
 ///
 /// Each community has an independent chain keyed `(community_id, seq)`. Writes
@@ -57,14 +82,7 @@ impl AuditService {
     )]
     pub async fn log(&self, entry: NewAuditEntry) -> Result<AuditEntry, AuditError> {
         let mut conn = self.pool.acquire().await?;
-
-        // Per-community advisory lock: hash the namespaced community id to an
-        // i64 lock key inside Postgres. Communities lock independently.
-        let lock_key = format!("{AUDIT_LOCK_NAMESPACE}{}", entry.community_id);
-        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
-            .bind(&lock_key)
-            .execute(&mut *conn)
-            .await?;
+        let lock_key = lock_community_chain(&mut conn, entry.community_id).await?;
 
         // Run the chain append and release the lock regardless of outcome.
         // catch_unwind so a panic still releases the lock before the connection
@@ -73,11 +91,48 @@ impl AuditService {
             .catch_unwind()
             .await;
 
-        let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
-            .bind(&lock_key)
-            .execute(&mut *conn)
-            .await;
+        unlock_community_chain(&mut conn, &lock_key).await;
+        match result {
+            Ok(inner_result) => inner_result,
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+        }
+    }
 
+    /// Append `entry` unless this community's chain already holds an entry with
+    /// the same action and `object_id`; returns `None` in that case.
+    ///
+    /// The check runs under the same per-community lock as the append, so
+    /// concurrent writers of one object record it once. Only `event_created`
+    /// lookups are indexed (`idx_audit_log_event_created_object`).
+    #[datastore_span(
+        name = "audit_log_once",
+        system = "postgresql",
+        fields(action = %entry.action)
+    )]
+    pub async fn log_once(&self, entry: NewAuditEntry) -> Result<Option<AuditEntry>, AuditError> {
+        let mut conn = self.pool.acquire().await?;
+        let lock_key = lock_community_chain(&mut conn, entry.community_id).await?;
+
+        let result = std::panic::AssertUnwindSafe(async {
+            let recorded = sqlx::query(
+                "SELECT 1 FROM audit_log
+                 WHERE community_id = $1 AND action = $2 AND object_id = $3
+                 LIMIT 1",
+            )
+            .bind(entry.community_id.as_uuid())
+            .bind(entry.action.as_str())
+            .bind(entry.object_id.as_deref())
+            .fetch_optional(&mut *conn)
+            .await?;
+            if recorded.is_some() {
+                return Ok(None);
+            }
+            self.log_inner(&mut conn, entry).await.map(Some)
+        })
+        .catch_unwind()
+        .await;
+
+        unlock_community_chain(&mut conn, &lock_key).await;
         match result {
             Ok(inner_result) => inner_result,
             Err(panic_payload) => std::panic::resume_unwind(panic_payload),
