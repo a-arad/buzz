@@ -291,6 +291,25 @@ pub async fn hold_abandoned_dispatches(pool: &PgPool) -> Result<u64> {
     .rows_affected())
 }
 
+/// Whether the community's audit chain already records `event_created` for
+/// `event_id_hex`. Served by `idx_audit_log_event_created_object`.
+pub async fn event_created_audit_recorded(
+    pool: &PgPool,
+    community: CommunityId,
+    event_id_hex: &str,
+) -> Result<bool> {
+    let mut connection =
+        crate::observability::acquire_writer(pool, WriterOperation::Maintenance).await?;
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM audit_log \
+         WHERE community_id = $1 AND action = 'event_created' AND object_id = $2)",
+    )
+    .bind(community.as_uuid())
+    .bind(event_id_hex)
+    .fetch_one(&mut *connection)
+    .await?)
+}
+
 /// Row counts by state, for the queue gauges.
 pub async fn dispatch_queue_counts(pool: &PgPool) -> Result<Vec<(String, i64)>> {
     let mut connection =
@@ -339,6 +358,16 @@ impl Db {
     #[datastore_span(name = "hold_abandoned_dispatches", system = "postgresql")]
     pub async fn hold_abandoned_dispatches(&self) -> Result<u64> {
         hold_abandoned_dispatches(&self.pool).await
+    }
+
+    /// Whether an event's `event_created` audit entry is already recorded.
+    #[datastore_span(name = "event_created_audit_recorded", system = "postgresql")]
+    pub async fn event_created_audit_recorded(
+        &self,
+        community: CommunityId,
+        event_id_hex: &str,
+    ) -> Result<bool> {
+        event_created_audit_recorded(&self.pool, community, event_id_hex).await
     }
 
     /// Dispatch queue row counts by state.

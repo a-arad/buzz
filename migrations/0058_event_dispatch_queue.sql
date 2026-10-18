@@ -31,17 +31,37 @@ CREATE INDEX event_dispatch_queue_due
 CREATE INDEX event_dispatch_queue_recovery
     ON event_dispatch_queue (lease_until) WHERE state = 'dispatching';
 
+-- The two indexes below follow 0049: startup is bounded, so a large or busy
+-- table fails deployment rather than blocking writes for an unbounded build.
+-- Operators can prebuild either index CONCURRENTLY with the same definition;
+-- the migration then only verifies it. See docs/event-dispatch-recovery.md.
+
 -- At most one run per (workflow, triggering event), so repeated dispatch cannot
--- start a workflow twice. Run creation resolves conflicts on this index.
-CREATE UNIQUE INDEX idx_workflow_runs_trigger_event
-    ON workflow_runs (community_id, trigger_event_id, workflow_id)
-    WHERE trigger_event_id IS NOT NULL;
+-- start a workflow twice. Run creation resolves conflicts on this index. The
+-- build fails if the table already holds such duplicates.
+DO $$
+BEGIN
+    IF to_regclass('public.idx_workflow_runs_trigger_event') IS NULL THEN
+        CREATE UNIQUE INDEX idx_workflow_runs_trigger_event
+            ON public.workflow_runs (community_id, trigger_event_id, workflow_id)
+            WHERE trigger_event_id IS NOT NULL;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname = 'idx_workflow_runs_trigger_event'
+          AND i.indisvalid AND i.indisready AND i.indislive
+          AND pg_get_indexdef(i.indexrelid) =
+              'CREATE UNIQUE INDEX idx_workflow_runs_trigger_event ON public.workflow_runs USING btree (community_id, trigger_event_id, workflow_id) WHERE (trigger_event_id IS NOT NULL)'
+    ) THEN
+        RAISE EXCEPTION 'idx_workflow_runs_trigger_event invalid or wrong definition; see docs/event-dispatch-recovery.md';
+    END IF;
+END $$;
 
 -- At most one event_created audit entry per event: the audit writer checks this
--- index under its per-community lock. Startup is bounded as in 0049: a large or
--- busy audit_log fails deployment rather than blocking audit writes for an
--- unbounded build. Operators can prebuild the index CONCURRENTLY with the same
--- definition; see docs/event-dispatch-recovery.md.
+-- index under its per-community lock.
 DO $$
 BEGIN
     IF to_regclass('public.idx_audit_log_event_created_object') IS NULL THEN

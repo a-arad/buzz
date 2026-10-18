@@ -2,7 +2,7 @@
 //!
 //! Builds Nostr events, persists them, and delegates post-persist side effects
 //! (WebSocket fan-out, Redis pub/sub, search indexing, audit logging) to the
-//! existing [`dispatch_persistent_event`] helper.
+//! existing [`dispatch_obligated_event`] helper.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -16,7 +16,7 @@ use nostr::{EventBuilder, Kind, Tag};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::handlers::event::dispatch_persistent_event;
+use crate::handlers::event::dispatch_obligated_event;
 use crate::state::AppState;
 
 /// Resolves `@Name` mentions in workflow message text to the pubkeys of the
@@ -187,7 +187,7 @@ fn append_workflow_mention_tags(
 /// `AppState` → `WorkflowEngine` → `ActionSink` → `AppState`. Using `Weak`
 /// breaks the cycle so all structs can be dropped on shutdown.
 ///
-/// Post-persist side effects are delegated to [`dispatch_persistent_event`]
+/// Post-persist side effects are delegated to [`dispatch_obligated_event`]
 /// for consistency with the REST/WebSocket paths.
 pub struct RelayActionSink {
     state: Weak<AppState>,
@@ -432,7 +432,7 @@ impl ActionSink for RelayActionSink {
             });
 
             // The insert writes the message's dispatch obligation, audited as
-            // the triggering user; `dispatch_persistent_event` discharges it.
+            // the triggering user; `dispatch_obligated_event` discharges it.
             let obligation = buzz_db::event_dispatch::DispatchObligation::new(
                 event.id.to_bytes(),
                 hex::decode(&author_pubkey_hex).ok(),
@@ -450,7 +450,7 @@ impl ActionSink for RelayActionSink {
             // 5. Post-persist side effects (fan-out, search, audit)
             //    Only if actually inserted (idempotency guard).
             if was_inserted {
-                let _ = dispatch_persistent_event(
+                let _ = dispatch_obligated_event(
                     &tenant,
                     &state,
                     &stored_event,

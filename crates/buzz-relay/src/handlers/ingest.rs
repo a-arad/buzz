@@ -43,7 +43,7 @@ use nostr::Event;
 
 use crate::state::AppState;
 
-use super::event::dispatch_persistent_event;
+use super::event::dispatch_obligated_event;
 
 use crate::conformance::{
     self as conf, channel_label, claimed_community_from_event, emit, msg_id_label,
@@ -3347,7 +3347,7 @@ async fn ingest_event_inner(
             },
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
-        dispatch_persistent_event(
+        dispatch_obligated_event(
             tenant,
             state,
             &stored_event,
@@ -3376,7 +3376,7 @@ async fn ingest_event_inner(
 
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
     // The insert writes the event's dispatch obligation in its own transaction;
-    // `dispatch_persistent_event` below discharges it.
+    // `dispatch_obligated_event` below discharges it.
     let (stored_event, was_inserted) = dispatch_obligation(&event, &auth)
         .scope(async {
             Ok::<_, IngestError>(if workflow_deletion {
@@ -3549,7 +3549,7 @@ async fn ingest_event_inner(
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
     }
-    dispatch_persistent_event(
+    dispatch_obligated_event(
         tenant,
         state,
         &stored_event,
@@ -6768,6 +6768,100 @@ mod postgres_tests {
             .await
             .expect("connect test Postgres");
         build_canvas_ingest_state(&db_url, &pool).await
+    }
+
+    /// Ingest writes the event's dispatch obligation in its insert transaction
+    /// and keeps it when a post-commit effect fails: this state's Redis is
+    /// unreachable, so the publish fails. A duplicate submission adds none.
+    /// Mutations: drop the obligation scope in `ingest_event`, or discharge a
+    /// failed pass's obligation → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn ingest_keeps_dispatch_obligation_when_an_effect_fails() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use nostr::{Keys, Tag};
+
+        let state = ingest_state().await;
+        let host = format!("dispatch-obligation-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+        let author = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel_id,
+                &format!("dispatch-{}", channel_id.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                author.public_key().to_bytes().as_slice(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        state.membership_cache.insert(
+            (
+                community,
+                channel_id,
+                author.public_key().to_bytes().to_vec(),
+            ),
+            true,
+        );
+        let event = EventBuilder::new(Kind::Custom(9), "owes dispatch")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+            .sign_with_keys(&author)
+            .expect("sign post");
+        let auth = || IngestAuth::Http {
+            pubkey: author.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        let obligation = || async {
+            sqlx::query_as::<_, (String, i32, Option<Vec<u8>>)>(
+                "SELECT state, attempts, actor_pubkey FROM event_dispatch_queue \
+                 WHERE community_id = $1 AND event_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .fetch_all(state.db.pool())
+            .await
+            .expect("read obligations")
+        };
+
+        let accepted = ingest_event(&state, &tenant, event.clone(), auth())
+            .await
+            .expect("ingest");
+        assert!(accepted.accepted);
+        // The spawned pass fails fast against the closed Redis port.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            obligation().await,
+            vec![(
+                "pending".to_owned(),
+                0,
+                Some(author.public_key().to_bytes().to_vec())
+            )]
+        );
+
+        let resent = ingest_event(&state, &tenant, event.clone(), auth())
+            .await
+            .expect("resend");
+        assert_eq!(resent.message, "duplicate:");
+        assert_eq!(obligation().await.len(), 1);
+
+        // Leave no due obligation behind for other tests' claims.
+        sqlx::query("DELETE FROM event_dispatch_queue WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(state.db.pool())
+            .await
+            .expect("clean up obligation");
     }
 
     /// An owner's timeout reaches its agent, and it is enforced before command
