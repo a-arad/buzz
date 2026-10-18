@@ -14,6 +14,7 @@
 use std::{sync::Arc, time::Duration};
 
 use chrono::{TimeDelta, Utc};
+use futures_util::future::join_all;
 use tracing::{error, warn};
 
 use buzz_core::kind::event_kind_u32;
@@ -118,17 +119,17 @@ pub(crate) async fn process_batch(
         }
     };
 
-    let mut done = Vec::new();
-    let mut failed = Vec::new();
-    for job in &batch.jobs {
-        let event_id = job.event.event.id.as_bytes().to_vec();
+    // Passes run concurrently, so one slow audit receipt cannot stretch the
+    // batch past its claim lease.
+    let tenant = &tenant;
+    let outcomes = join_all(batch.jobs.iter().map(|job| async move {
         let actor_hex = hex::encode(
             job.actor_pubkey
                 .clone()
                 .unwrap_or_else(|| job.event.event.pubkey.to_bytes().to_vec()),
         );
         let outcome = dispatch_persistent_event_inner(
-            &tenant,
+            tenant,
             state,
             &job.event,
             event_kind_u32(&job.event.event),
@@ -138,6 +139,14 @@ pub(crate) async fn process_batch(
             true,
         )
         .await;
+        (job, outcome)
+    }))
+    .await;
+
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for (job, outcome) in outcomes {
+        let event_id = job.event.event.id.as_bytes().to_vec();
         match outcome.failure {
             None => {
                 metrics::counter!("buzz_event_dispatch_recovered_total").increment(1);
