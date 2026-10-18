@@ -254,6 +254,13 @@ pub(crate) async fn filter_fanout_by_access_checked(
             }
         }
         Ok(_) => {}
+        // A deleted channel has no readers: a denial, not a failed lookup.
+        Err(buzz_db::DbError::ChannelNotFound(_)) => {
+            return FanoutAccess {
+                allowed: Vec::new(),
+                lookup_failed: false,
+            }
+        }
         Err(e) => {
             // Fail closed: if we cannot determine visibility, do not leak a
             // possibly-private channel's events.
@@ -3088,21 +3095,29 @@ mod tests {
             .await;
         }
 
-        /// Wait for the event's in-process pass to record its audit entry, then
-        /// give it a moment to settle its obligation.
+        /// Wait for the event's in-process pass to record its audit entry and
+        /// settle its obligation: poll until it is discharged when that is
+        /// `expected`, otherwise give the pass a moment to (wrongly) discharge
+        /// it.
         async fn await_in_process_pass(
             pool: &sqlx::PgPool,
             tenant: &buzz_core::tenant::TenantContext,
             event: &nostr::Event,
+            expected: (i64, i64),
         ) -> (i64, i64) {
-            for _ in 0..50 {
-                if obligation_and_audit_rows(pool, tenant, event).await.1 == 1 {
+            let mut rows = (0, 0);
+            for _ in 0..100 {
+                rows = obligation_and_audit_rows(pool, tenant, event).await;
+                if rows.1 == 1 && (expected.0 != 0 || rows == expected) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            obligation_and_audit_rows(pool, tenant, event).await
+            if expected.0 != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                rows = obligation_and_audit_rows(pool, tenant, event).await;
+            }
+            rows
         }
 
         /// A failed membership lookup during fan-out keeps the event's
@@ -3184,7 +3199,7 @@ mod tests {
                     .accepted
             );
             assert_eq!(
-                await_in_process_pass(&pool, &tenant, &event).await,
+                await_in_process_pass(&pool, &tenant, &event, (1, 1)).await,
                 (1, 1),
                 "obligation kept after the failed lookup"
             );
@@ -3228,7 +3243,7 @@ mod tests {
                     .accepted
             );
             assert_eq!(
-                await_in_process_pass(&pool, &tenant, &second).await,
+                await_in_process_pass(&pool, &tenant, &second, (0, 1)).await,
                 (0, 1),
                 "obligation discharged although the non-member got nothing"
             );
@@ -3297,7 +3312,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                await_in_process_pass(&pool, &tenant, &event).await,
+                await_in_process_pass(&pool, &tenant, &event, (1, 1)).await,
                 (1, 1),
                 "obligation kept after the failed lookup"
             );
@@ -3310,6 +3325,65 @@ mod tests {
                 (0, 1)
             );
             assert_eq!(frames_for(&mut reader_rx, &mut seen, &event), 1);
+        }
+
+        /// A deleted channel is a denial, not a failed lookup: its event's
+        /// obligation is discharged with no copies sent. Mutation: count
+        /// `ChannelNotFound` as `lookup_failed` → RED (obligation kept).
+        #[tokio::test]
+        async fn deleted_channel_discharges_the_obligation() {
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping deleted channel test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-deleted-channel").await;
+            let community = tenant.community();
+            let author_pk = author.public_key().to_bytes().to_vec();
+            let reader = Keys::generate().public_key().to_bytes().to_vec();
+            let mut reader_rx = subscribed_conn(&state, community, channel_id, &reader);
+            let mut seen = 0;
+            let event = EventBuilder::new(Kind::Custom(9), "channel deleted before dispatch")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let (stored, inserted) = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                Some(author_pk.clone()),
+            )
+            .scope(state.db.insert_event_with_thread_metadata(
+                community,
+                &event,
+                Some(channel_id),
+                None,
+            ))
+            .await
+            .expect("insert under obligation");
+            assert!(inserted);
+            sqlx::query(
+                "UPDATE channels SET deleted_at = now() WHERE community_id = $1 AND id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .expect("delete channel");
+            super::super::dispatch_obligated_event(
+                &tenant,
+                &state,
+                &stored,
+                9,
+                &hex::encode(&author_pk),
+                None,
+            )
+            .await;
+            assert_eq!(
+                await_in_process_pass(&pool, &tenant, &event, (0, 1)).await,
+                (0, 1),
+                "obligation discharged"
+            );
+            assert_eq!(frames_for(&mut reader_rx, &mut seen, &event), 0);
         }
 
         /// Integrated isolation: a community resolved from the request's

@@ -15,15 +15,19 @@ Migration `0058_event_dispatch_queue.sql` gives that work a durable owner.
   recorded, Redis publish succeeded, local fan-out ran and every matching
   workflow run was claimed. If any step fails, the row stays. Local fan-out
   fails when a visibility or membership lookup fails for a recipient: that
-  recipient gets nothing (delivery still fails closed) and the row stays, so a
-  later pass reaches it. A recipient denied access is not a failure.
+  recipient gets nothing (delivery still fails closed) and the row stays for a
+  later pass. A recipient denied access, or a deleted channel, is not a
+  failure. The later pass may run on another relay; it reaches this relay's
+  subscribers only through Redis (see the limits below).
 - Every relay runs a recovery worker. It claims rows 30 seconds after commit,
   or when a claim's 60-second lease has expired, and runs the same dispatch
   again. Visibility and membership are looked up fresh.
 - A failed attempt backs off (5 s, doubling, capped at 10 minutes). After 8
   attempts, about 11 minutes after commit, the row is **held**: kept for an
-  operator, never retried on its own. Rows whose event was deleted, or whose
-  community is no longer served, are dropped without dispatch.
+  operator, never retried on its own. Rows whose event was deleted are dropped
+  without dispatch. Rows of an archived community are retried like any other
+  failure (`community not served`) and end up held; rearm them if the
+  community is unarchived, or delete them.
 - Each attempt runs every effect again; there is no per-effect progress. A
   recovery attempt re-queues the audit entry only when it is not recorded yet.
 
