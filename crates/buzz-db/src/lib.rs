@@ -4615,7 +4615,7 @@ impl Db {
             ));
         }
         crate::event_dispatch::enqueue_for_admitted_insert(
-            &mut *tx,
+            &mut tx,
             community_id,
             event.id.as_bytes().as_slice(),
         )
@@ -5015,7 +5015,7 @@ impl Db {
             ));
         }
         crate::event_dispatch::enqueue_for_admitted_insert(
-            &mut *tx,
+            &mut tx,
             community_id,
             event.id.as_bytes().as_slice(),
         )

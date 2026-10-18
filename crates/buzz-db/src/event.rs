@@ -1166,7 +1166,7 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
 
     if was_inserted {
         crate::event_dispatch::enqueue_for_admitted_insert(
-            &mut **tx,
+            tx,
             community_id,
             id_bytes.as_slice(),
         )
