@@ -164,6 +164,71 @@ the binary with `BUZZ_AUTO_MIGRATE=false`, which skips the migrator. Do not
 delete the `_sqlx_migrations` row or restore an older database.
 
 The older binary ignores the queue table and both indexes. It writes no
-obligations and leaves existing rows alone. Rows still in the table when the
-newer binary returns are dispatched then, so their workflows fire late. Inspect
-them before rolling forward and delete any you do not want delivered.
+obligations and leaves existing rows alone. When a newer binary returns, its
+worker can claim due pending rows and expired leases immediately; held rows
+are excluded. Inspect retained work **before** starting any newer binary.
+Delayed dispatch uses the workflow-selection rules above, so review the
+current definition, authority, age and prior effects before approving it.
+
+### Hold retained work before roll-forward
+
+Only use this procedure after rollback has stopped **every** newer relay
+process, including old replicas of the newer image and their in-flight tasks.
+Verify that only the old, queue-unaware binaries serve, with migrations
+disabled. Lease expiry alone does not prove a worker stopped. A row update
+cannot cancel dispatch already in flight: successful dispatch deletes its
+obligation without checking the claim id. If worker quiescence is unknown,
+do not change its claim or start roll-forward.
+
+Use a SQL client that stops on errors (for psql, `ON_ERROR_STOP=1`).
+For each unapproved pending or leased obligation, save its complete row and
+related workflow-run states in a private operator receipt. Then hold the exact
+community/event pair. Use the same values in all three statements below. This
+transaction fails if the row is absent or already held; inspect that result
+instead of broadening the selection. Existing held rows need no update.
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '1s';
+SET LOCAL statement_timeout = '5s';
+SELECT * FROM event_dispatch_queue
+WHERE community_id = '<community uuid>'
+  AND event_id = decode('<event id hex>', 'hex')
+FOR UPDATE;
+DO $hold$
+DECLARE affected bigint;
+BEGIN
+    UPDATE event_dispatch_queue
+    SET state = 'held', claim_id = NULL, lease_until = NULL,
+        last_error = 'operator hold: rollback review'
+    WHERE state IN ('pending', 'dispatching')
+      AND community_id = '<community uuid>'
+      AND event_id = decode('<event id hex>', 'hex');
+    GET DIAGNOSTICS affected = ROW_COUNT;
+    IF affected <> 1 THEN
+        RAISE EXCEPTION 'expected one pending/dispatching obligation, got %', affected;
+    END IF;
+END
+$hold$;
+SELECT * FROM event_dispatch_queue
+WHERE community_id = '<community uuid>'
+  AND event_id = decode('<event id hex>', 'hex');
+COMMIT;
+```
+
+Retain the before/after rows and verify the transaction committed. Attempts,
+timestamps, event identity and actor remain unchanged; the prior error and
+claim are preserved in the operator receipt. The distinct hold reason keeps
+the row out of cause-specific rearm sweeps. It counts in the held queue gauge;
+record its owner and review requirement without silencing unrelated holds.
+
+Before roll-forward, reconcile the inventory: every unapproved pending or
+leased row must now be held, and every row left eligible must have an explicit
+dispatch decision. Keep uncertain workflow runs unchanged; holding a dispatch
+row does not cancel, reset or prove the outcome of a workflow run.
+
+After approval, use the single-event rearm statement above, adding
+`AND last_error = 'operator hold: rollback review'`. Require one affected row
+and record the approval and resulting row. Do not rearm all held work as part
+of roll-forward. Do not delete an obligation as routine cancellation: deletion
+abandons remaining effects and removes the queue evidence.
