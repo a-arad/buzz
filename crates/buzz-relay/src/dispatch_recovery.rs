@@ -109,7 +109,13 @@ pub(crate) async fn process_batch(
     let tenant = match state.db.lookup_community_host(community).await {
         Ok(Some(host)) => buzz_core::tenant::TenantContext::resolved(community, host),
         Ok(None) => {
-            release(state, &batch, ids(), "community host not found").await;
+            // The community is archived or gone: nobody can receive these.
+            warn!(%community, jobs = batch.jobs.len(), "dispatch obligations dropped: community not served");
+            metrics::counter!("buzz_event_dispatch_dropped_total", "reason" => "community_not_served")
+                .increment(batch.jobs.len() as u64);
+            if let Err(e) = state.db.complete_dispatch(community, &ids()).await {
+                warn!(%community, "dispatch obligation delete failed: {e}");
+            }
             return;
         }
         Err(e) => {
@@ -120,34 +126,39 @@ pub(crate) async fn process_batch(
     };
 
     // Passes run concurrently, so one slow audit receipt cannot stretch the
-    // batch past its claim lease.
-    let tenant = &tenant;
-    let outcomes = join_all(batch.jobs.iter().map(|job| async move {
-        let actor_hex = hex::encode(
-            job.actor_pubkey
-                .clone()
-                .unwrap_or_else(|| job.event.event.pubkey.to_bytes().to_vec()),
-        );
-        let outcome = dispatch_persistent_event_inner(
-            tenant,
-            state,
-            &job.event,
-            event_kind_u32(&job.event.event),
-            &actor_hex,
-            AuditStep::Enqueue,
-            None,
-            true,
-        )
-        .await;
-        (job, outcome)
-    }))
-    .await;
+    // batch past its claim lease, and each runs in its own task, so a panic
+    // fails that obligation instead of stopping the worker.
+    let passes = batch.jobs.iter().map(|job| {
+        let state = Arc::clone(state);
+        let tenant = tenant.clone();
+        let job = job.clone();
+        tokio::spawn(async move {
+            let actor_hex = hex::encode(
+                job.actor_pubkey
+                    .clone()
+                    .unwrap_or_else(|| job.event.event.pubkey.to_bytes().to_vec()),
+            );
+            dispatch_persistent_event_inner(
+                &tenant,
+                &state,
+                &job.event,
+                event_kind_u32(&job.event.event),
+                &actor_hex,
+                AuditStep::Enqueue,
+                None,
+                true,
+            )
+            .await
+            .failure
+        })
+    });
+    let outcomes = join_all(passes).await;
 
     let mut done = Vec::new();
     let mut failed = Vec::new();
-    for (job, outcome) in outcomes {
+    for (job, outcome) in batch.jobs.iter().zip(outcomes) {
         let event_id = job.event.event.id.as_bytes().to_vec();
-        match outcome.failure {
+        match outcome.unwrap_or(Some("panic")) {
             None => {
                 metrics::counter!("buzz_event_dispatch_recovered_total").increment(1);
                 done.push(event_id);

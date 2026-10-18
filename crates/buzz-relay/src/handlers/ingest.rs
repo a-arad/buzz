@@ -43,7 +43,7 @@ use nostr::Event;
 
 use crate::state::AppState;
 
-use super::event::dispatch_persistent_event;
+use super::event::dispatch_obligated_event;
 
 use crate::conformance::{
     self as conf, channel_label, claimed_community_from_event, emit, msg_id_label,
@@ -2881,7 +2881,7 @@ async fn ingest_event_inner(
             }
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
-        dispatch_persistent_event(
+        dispatch_obligated_event(
             tenant,
             state,
             &stored_event,
@@ -2900,7 +2900,7 @@ async fn ingest_event_inner(
     }
 
     // The insert writes the event's dispatch obligation in its own transaction;
-    // `dispatch_persistent_event` below discharges it.
+    // `dispatch_obligated_event` below discharges it.
     let (stored_event, was_inserted) = dispatch_obligation(&event, &auth)
         .scope(async {
             Ok::<_, IngestError>(if buzz_core::kind::is_replaceable(kind_u32) {
@@ -3030,7 +3030,7 @@ async fn ingest_event_inner(
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
     }
-    dispatch_persistent_event(
+    dispatch_obligated_event(
         tenant,
         state,
         &stored_event,

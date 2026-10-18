@@ -1165,12 +1165,8 @@ pub(crate) async fn insert_event_with_thread_metadata_tx(
     let was_inserted = result.rows_affected() > 0;
 
     if was_inserted {
-        crate::event_dispatch::enqueue_for_admitted_insert(
-            tx,
-            community_id,
-            id_bytes.as_slice(),
-        )
-        .await?;
+        crate::event_dispatch::enqueue_for_admitted_insert(tx, community_id, id_bytes.as_slice())
+            .await?;
 
         if let Some(ref meta) = thread_meta {
             let broadcast_val: bool = meta.broadcast;

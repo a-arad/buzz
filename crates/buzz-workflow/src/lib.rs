@@ -328,10 +328,11 @@ impl WorkflowEngine {
     }
 
     /// [`Self::on_event`] for an event whose earlier dispatch may have stopped
-    /// part way. Workflows are matched, and their definition and owner
-    /// authority checked, against current state. A run reserved by the earlier
-    /// dispatch that never started is executed if its workflow still matches,
-    /// and cancelled otherwise.
+    /// part way. Workflows are read from the database, bypassing the cache,
+    /// and matched and authority-checked against that read. A run reserved by
+    /// the earlier dispatch that never started is executed if its workflow
+    /// still matches, and cancelled otherwise. A run that already started is
+    /// never executed again.
     pub async fn on_recovered_event(
         self: &Arc<Self>,
         community_id: CommunityId,
@@ -363,7 +364,16 @@ impl WorkflowEngine {
         }
 
         let cache_key = (community_id, channel_id);
-        let workflows = match self.workflow_cache.get(&cache_key) {
+        // A recovery pass reads the current definitions, not this replica's
+        // cache: another replica may have edited or disabled a workflow since
+        // the entry was filled. The read happens once, before any claim, so an
+        // edit that commits after it is first seen by the next pass.
+        let cached = if recovered {
+            None
+        } else {
+            self.workflow_cache.get(&cache_key)
+        };
+        let workflows = match cached {
             Some(cached) => cached,
             None => {
                 let fresh = Arc::new(
@@ -1920,6 +1930,66 @@ steps:
             1,
             "no new run may be created after the owner lost membership"
         );
+    }
+
+    /// A recovery pass selects workflows from the database, not from this
+    /// replica's cache: another replica can disable a workflow while the
+    /// entry here is still warm. Mutation: read the cache on recovery → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn recovered_event_selects_past_a_warm_cache() {
+        let db = setup_db().await;
+        let creator = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let member = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let (community, channel_id) = setup_channel(&db, &creator, &member).await;
+        let def_json = serde_json::json!({
+            "name": "recovery-selection",
+            "trigger": {"on": "message_posted"},
+            "steps": [{"id": "s1", "action": "send_message", "text": "hi"}],
+            "enabled": true,
+        })
+        .to_string();
+        let workflow_id = db
+            .create_workflow(
+                community,
+                Some(channel_id),
+                &member,
+                "recovery-selection",
+                &def_json,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+        let engine = Arc::new(WorkflowEngine::new(db.clone(), WorkflowConfig::default()));
+        let runs = || async {
+            db.list_workflow_runs(community, workflow_id, 10)
+                .await
+                .expect("list runs")
+                .len()
+        };
+
+        // Fills this replica's cache with the enabled workflow.
+        engine
+            .on_event(community, &message_event(channel_id))
+            .await
+            .expect("warm cache");
+        assert_eq!(runs().await, 1);
+
+        // Another replica disables it; nothing invalidates this cache.
+        db.set_workflow_enabled(community, workflow_id, false)
+            .await
+            .expect("disable workflow");
+        engine
+            .on_event(community, &message_event(channel_id))
+            .await
+            .expect("live event");
+        assert_eq!(runs().await, 2, "a live event still uses the warm cache");
+
+        engine
+            .on_recovered_event(community, &message_event(channel_id))
+            .await
+            .expect("recovered event");
+        assert_eq!(runs().await, 2, "recovery sees the workflow disabled");
     }
 
     /// Exfiltration-capable definitions (call_webhook) require the owner to
