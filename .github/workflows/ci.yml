@@ -353,9 +353,11 @@ jobs:
           cargo build --profile ci -p buzz-relay -p git-credential-nostr
           cargo nextest archive \
             --cargo-profile ci \
+            -p buzz-audit \
             -p buzz-db \
             -p buzz-relay \
             -p buzz-test-client \
+            -p buzz-workflow \
             --lib \
             --test e2e_event_reminder \
             --archive-file target/ci/backend-integration-tests.tar.zst
@@ -658,6 +660,78 @@ jobs:
           VALUES ('00000000-0000-4000-8000-00000000c0de', 'localhost:3000')
           ON CONFLICT (lower(host)) DO NOTHING
           ;"
+      - name: Dispatch obligation contract tests
+        # Tests for docs/event-dispatch-recovery.md. The default suites skip
+        # them: six are #[ignore]d, and the relay tests return early when
+        # Postgres or Redis is unreachable. Run them before the relay starts,
+        # because its recovery worker claims due obligations from the whole
+        # database and would race the claim tests. The listing fails the step
+        # if the archive lacks a package or a test was renamed away.
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          BUZZ_TEST_DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+        run: |
+          set -euo pipefail
+          archive=target/ci/backend-integration-tests.tar.zst
+          expected='buzz-audit log_once_records_an_object_once
+          buzz-db abandoned_final_attempt_is_held_and_deleted_event_is_dropped
+          buzz-db event_triggered_runs_are_created_and_claimed_once
+          buzz-db obligation_commits_with_its_event_insert_only
+          buzz-db recovery_claims_are_fenced_backed_off_and_held
+          buzz-relay archived_community_keeps_its_obligations
+          buzz-relay deleted_channel_discharges_the_obligation
+          buzz-relay ingested_event_discharges_its_dispatch_obligation
+          buzz-relay membership_lookup_failure_keeps_the_obligation
+          buzz-relay recovery_pass_discharges_a_left_obligation_once
+          buzz-relay repeated_dispatch_records_event_created_once
+          buzz-relay visibility_lookup_failure_keeps_the_obligation
+          buzz-workflow recovered_event_selects_past_a_warm_cache'
+          want=$(sort <<<"$expected")
+          count=$(grep -c '' <<<"$want")
+          tests=$(awk '{print "test(/::" $2 "$/)"}' <<<"$want" | paste -sd'|' - | sed 's/|/ or /g')
+          filter="kind(lib) and (package(buzz-audit) or package(buzz-db) or package(buzz-relay) or package(buzz-workflow)) and (${tests})"
+
+          cargo nextest list --archive-file "$archive" --run-ignored all \
+            -E "$filter" --message-format json > /tmp/dispatch-tests.json
+          for package in buzz-audit buzz-db buzz-relay buzz-workflow; do
+            if ! jq -e --arg id "$package" '."rust-suites" | has($id)' /tmp/dispatch-tests.json >/dev/null; then
+              echo "test archive has no $package library tests" >&2
+              exit 1
+            fi
+          done
+          selected=$(jq -r '."rust-suites"[] | ."binary-id" as $id | .testcases | to_entries[]
+            | select(.value."filter-match".status == "matches") | "\($id) \(.key)"' /tmp/dispatch-tests.json | sort)
+          echo "$selected"
+          got=$(awk '{n = split($2, path, "::"); print $1, path[n]}' <<<"$selected" | sort)
+          if [ "$got" != "$want" ]; then
+            echo "selected dispatch tests differ from the expected inventory:" >&2
+            diff <(echo "$want") <(echo "$got") >&2 || true
+            exit 1
+          fi
+
+          # A relay test that cannot reach either service prints "skipping" and
+          # passes; buzz-audit's returns silently, so check both services first.
+          (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null || { echo "Postgres is not accepting connections on 127.0.0.1:5432" >&2; exit 1; }
+          pong=''
+          exec 3<>/dev/tcp/127.0.0.1/6379
+          printf 'PING\r\n' >&3
+          read -r -t 5 pong <&3 || true
+          exec 3>&-
+          if [ "${pong%$'\r'}" != "+PONG" ]; then
+            echo "Redis did not answer PING on 127.0.0.1:6379: ${pong:-no reply}" >&2
+            exit 1
+          fi
+
+          cargo nextest run --archive-file "$archive" --run-ignored all \
+            -E "$filter" --no-capture --color never 2>&1 | tee /tmp/dispatch-tests.log
+          if grep -nE 'skipping .*(Postgres|Redis).*unavailable' /tmp/dispatch-tests.log; then
+            echo "a dispatch contract test skipped instead of running" >&2
+            exit 1
+          fi
+          if ! grep -qE "Summary .* ${count} tests? run: ${count} passed" /tmp/dispatch-tests.log; then
+            echo "expected ${count} dispatch contract tests to run and pass" >&2
+            exit 1
+          fi
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
