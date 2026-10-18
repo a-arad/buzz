@@ -91,7 +91,8 @@ jobs:
           echo "pre binary has the expect message: $(grep -c 'connect to DATABASE_URL' /tmp/audit-pre || true)"
       - name: Run cases
         run: |
-          set -uo pipefail
+          # Actions starts bash with -e; probes and negative cases exit non-zero by design.
+          set +e -uo pipefail
           url_for() {
             case "$1" in
               good) echo postgres://buzz:buzz_dev@localhost:5432/buzz ;;
