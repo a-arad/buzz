@@ -109,13 +109,9 @@ pub(crate) async fn process_batch(
     let tenant = match state.db.lookup_community_host(community).await {
         Ok(Some(host)) => buzz_core::tenant::TenantContext::resolved(community, host),
         Ok(None) => {
-            // The community is archived or gone: nobody can receive these.
-            warn!(%community, jobs = batch.jobs.len(), "dispatch obligations dropped: community not served");
-            metrics::counter!("buzz_event_dispatch_dropped_total", "reason" => "community_not_served")
-                .increment(batch.jobs.len() as u64);
-            if let Err(e) = state.db.complete_dispatch(community, &ids()).await {
-                warn!(%community, "dispatch obligation delete failed: {e}");
-            }
+            // Archived or gone. Archiving can be undone, so keep the
+            // obligations: they back off and are held for an operator.
+            release(state, &batch, ids(), "community not served").await;
             return;
         }
         Err(e) => {

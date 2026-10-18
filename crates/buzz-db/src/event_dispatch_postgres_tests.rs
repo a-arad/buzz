@@ -11,6 +11,11 @@ use nostr::{Event, EventBuilder, Keys, Kind};
 use sqlx::{PgPool, Row as _};
 use uuid::Uuid;
 
+/// A claim takes the community of the earliest due row in the whole database,
+/// so the tests that claim run one at a time.
+static CLAIMS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 async fn connect() -> Db {
     let config = DbConfig {
         database_url: std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -157,6 +162,7 @@ async fn obligation_commits_with_its_event_insert_only() {
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn recovery_claims_are_fenced_backed_off_and_held() {
+    let _claims = CLAIMS.lock().await;
     let db = connect().await;
     let pool = &db.pool;
     let community = create_community(pool).await;
@@ -272,6 +278,7 @@ async fn recovery_claims_are_fenced_backed_off_and_held() {
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn abandoned_final_attempt_is_held_and_deleted_event_is_dropped() {
+    let _claims = CLAIMS.lock().await;
     let db = connect().await;
     let pool = &db.pool;
     let community = create_community(pool).await;
