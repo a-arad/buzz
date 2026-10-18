@@ -1018,6 +1018,26 @@ pub async fn execute_run(
     execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
 }
 
+/// Execute an event-triggered run that the caller already moved to `running`
+/// with `claim_workflow_run`. Enforces the same concurrency limit as
+/// [`execute_run`], returning [`WorkflowError::CapacityExceeded`] immediately
+/// if all permits are taken.
+pub async fn execute_claimed_run(
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    def: &WorkflowDef,
+    trigger_ctx: &TriggerContext,
+) -> Result<ExecutionResult, (WorkflowError, crate::error::PartialProgress)> {
+    let _permit = engine.run_semaphore.try_acquire().map_err(|_| {
+        (
+            WorkflowError::CapacityExceeded,
+            crate::error::PartialProgress::default(),
+        )
+    })?;
+    execute_steps(engine, community_id, run_id, def, trigger_ctx, 0, None).await
+}
+
 /// Resume execution from a specific step index (used for approval resume).
 ///
 /// Acquires a concurrency permit from `engine.run_semaphore` before executing —

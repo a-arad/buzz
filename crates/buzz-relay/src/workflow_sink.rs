@@ -367,14 +367,19 @@ impl ActionSink for RelayActionSink {
                 broadcast: false,
             });
 
-            let (stored_event, was_inserted) = state
-                .db
-                .insert_event_with_thread_metadata(
+            // The insert writes the message's dispatch obligation, audited as
+            // the triggering user; `dispatch_persistent_event` discharges it.
+            let obligation = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                hex::decode(&author_pubkey_hex).ok(),
+            );
+            let (stored_event, was_inserted) = obligation
+                .scope(state.db.insert_event_with_thread_metadata(
                     tenant.community(),
                     &event,
                     Some(channel_uuid),
                     thread_meta,
-                )
+                ))
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?;
 

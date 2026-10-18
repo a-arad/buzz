@@ -6,6 +6,8 @@ mod admission;
 
 /// Operator-controlled private agent communication policy.
 pub mod agent_communication;
+/// Recovery worker for post-commit dispatch obligations.
+pub mod dispatch_recovery;
 
 /// REST API route handlers.
 pub mod api;

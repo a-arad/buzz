@@ -23,6 +23,10 @@ pub mod dm;
 pub mod error;
 /// Event storage and retrieval.
 pub mod event;
+/// Durable post-commit dispatch obligations for accepted events.
+pub mod event_dispatch;
+#[cfg(test)]
+mod event_dispatch_postgres_tests;
 /// Home feed queries.
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
@@ -3761,7 +3765,7 @@ impl Db {
         workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
     }
 
-    /// Create a new workflow run.
+    /// Create a workflow run, or return the existing run for its trigger event.
     pub async fn create_workflow_run(
         &self,
         community_id: CommunityId,
@@ -3775,6 +3779,31 @@ impl Db {
             workflow_id,
             trigger_event_id,
             trigger_context,
+        )
+        .await
+    }
+
+    /// Move a pending workflow run to running; `false` if it was not pending.
+    pub async fn claim_workflow_run(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+    ) -> Result<bool> {
+        workflow::claim_workflow_run(&self.pool, community_id, run_id).await
+    }
+
+    /// Cancel never-started runs of an event whose workflow was not selected.
+    pub async fn cancel_unselected_pending_runs(
+        &self,
+        community_id: CommunityId,
+        trigger_event_id: &[u8],
+        selected_workflows: &[Uuid],
+    ) -> Result<u64> {
+        workflow::cancel_unselected_pending_runs(
+            &self.pool,
+            community_id,
+            trigger_event_id,
+            selected_workflows,
         )
         .await
     }
@@ -4585,6 +4614,12 @@ impl Db {
                 false,
             ));
         }
+        crate::event_dispatch::enqueue_for_admitted_insert(
+            &mut *tx,
+            community_id,
+            event.id.as_bytes().as_slice(),
+        )
+        .await?;
 
         tx.commit().await?;
 
@@ -4979,6 +5014,12 @@ impl Db {
                 false,
             ));
         }
+        crate::event_dispatch::enqueue_for_admitted_insert(
+            &mut *tx,
+            community_id,
+            event.id.as_bytes().as_slice(),
+        )
+        .await?;
 
         if is_nip_rs {
             sqlx::query(

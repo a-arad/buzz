@@ -55,8 +55,9 @@ pub enum WorkflowError {
     Database(String),
 
     /// The workflow's owner is not currently authorized to run it (removed
-    /// from the channel, insufficient role for the definition's actions, or
-    /// the authority lookup failed — all deny, fail-closed).
+    /// from the channel, or insufficient role for the definition's actions).
+    /// A failed authority lookup is reported as [`Self::Database`] and denies
+    /// just the same.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
