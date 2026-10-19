@@ -7,6 +7,7 @@ mod git;
 mod git_runtime_tests;
 
 mod acp;
+mod attention;
 mod config;
 mod deployment_drain;
 mod edit_routing;
@@ -5944,6 +5945,7 @@ fn dispatch_private(
                 text: prompt_text,
                 source: PromptSource::Heartbeat,
                 reminder: None,
+                attention_context: None,
             }),
             ctx_clone,
             result_tx,

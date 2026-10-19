@@ -45,6 +45,8 @@ Open an owner-reviewed draft with `buzz agents draft-create --channel <current-c
 When work becomes useful later, retain its context and set a private reminder:
 `buzz reminders create --after 7d --note 'What to revisit, why, and where the evidence lives' --link 'buzz://message?channel=<uuid>&id=<event>'`.
 Use `--at` with an RFC3339 timezone for an absolute time. The link is optional.
+If this turn includes a managed `attention-context`, use its authoring interface and owned-set review instructions. The direct commands above are retired in that environment.
+
 Due reminders return to your identity in a private session, including after a
 harness restart; they do not restore the originating channel's in-memory context.
 Inspect current evidence and complete, snooze, or cancel the reminder as appropriate.

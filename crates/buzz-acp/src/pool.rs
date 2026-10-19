@@ -485,6 +485,8 @@ pub struct PrivatePrompt {
     pub source: PromptSource,
     /// Exact reminder occurrence, retained until its native turn is acknowledged.
     pub reminder: Option<(String, String)>,
+    /// Original task link; fresh reminder occurrences retain this ownership.
+    pub attention_context: Option<serde_json::Value>,
 }
 
 impl PromptSource {
@@ -2694,6 +2696,21 @@ pub async fn run_prompt_task(
     let recovery_reminder = private_prompt
         .as_ref()
         .and_then(|prompt| prompt.reminder.clone());
+    let attention_context = private_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.attention_context.clone())
+        .or_else(|| {
+            batch.as_ref().and_then(|batch| {
+            let event = batch.scope.root_event_id().map(str::to_owned)
+                .or_else(|| batch.events.first().map(|event| event.event.id.to_hex()))?;
+            let policy = if batch.scope.root_event_id().is_some() { "thread" } else { "channel" };
+            Some(serde_json::json!({
+                "link": format!("buzz://message?channel={}&id={event}", batch.scope.channel_id()),
+                "policy": policy,
+            }))
+        })
+        });
+    agent.acp.set_attention_context(attention_context);
     let prompt_text = private_prompt.map(|prompt| prompt.text);
     let observer_channel_id = source.channel_id();
     // Thread conversation context requires the canonical root to distinguish
@@ -3260,7 +3277,8 @@ pub async fn run_prompt_task(
                 reminder: None,
                 request: None,
             };
-            if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &[&init_msg]) {
+            if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &[&init_msg]).await
+            {
                 send_prompt_result(
                     &result_tx,
                     &turn_id,
@@ -3653,7 +3671,7 @@ pub async fn run_prompt_task(
         reminder: recovery_reminder.clone(),
         request: None,
     };
-    if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &prompt_blocks) {
+    if let Err(error) = crate::turn_recovery::begin(&mut agent, pending, &prompt_blocks).await {
         send_prompt_result(
             &result_tx,
             &turn_id,
@@ -7731,6 +7749,7 @@ for line in sys.stdin:
                     text: format!("Reminder {event}: inspect its original thread"),
                     source: PromptSource::Reminder,
                     reminder: Some(("same-reminder-id".into(), event.to_string())),
+                    attention_context: Some(serde_json::json!({"link": "buzz://message?channel=origin&id=root", "policy": "thread"})),
                 }),
                 Arc::clone(&context),
                 tx.clone(),
@@ -7755,6 +7774,12 @@ for line in sys.stdin:
             .iter()
             .filter(|r| r["method"] == "session/new")
             .collect();
+        for request in wire.iter().filter(|r| r["method"] == "session/prompt") {
+            assert_eq!(
+                request["params"]["_meta"]["axesAttentionContext"]["link"],
+                "buzz://message?channel=origin&id=root"
+            );
+        }
         assert_eq!(creations.len(), 2);
         for request in creations {
             let mut expected = contract["metadata"].clone();
@@ -7879,6 +7904,7 @@ done"#,
                     text: "only the new follow-up".into(),
                     source: PromptSource::Heartbeat,
                     reminder: None,
+                    attention_context: None,
                 }),
                 Arc::new(ctx),
                 tx,
@@ -7976,6 +8002,7 @@ done"#
                     text: format!("heartbeat-{turn}"),
                     source: PromptSource::Heartbeat,
                     reminder: None,
+                    attention_context: None,
                 }),
                 Arc::clone(&ctx),
                 result_tx.clone(),

@@ -677,6 +677,60 @@ async fn handle_workflow_def(
     let (def, definition_json_str) = buzz_workflow::WorkflowEngine::parse_yaml(&event.content)
         .map_err(|e| IngestError::Rejected(format!("invalid: workflow YAML parse error: {e}")))?;
     let workflow_name = extract_tag(event, "name").unwrap_or_else(|| def.name.clone());
+    for step in &def.steps {
+        if let buzz_workflow::schema::ActionDef::SendMessage {
+            thread_root: Some(root),
+            channel,
+            ..
+        } = &step.action
+        {
+            let root_id = hex::decode(root)
+                .map_err(|_| IngestError::Rejected("invalid: workflow thread root hex".into()))?;
+            let root_event = state
+                .db
+                .get_event_by_id_for_event_write(tenant.community(), &root_id)
+                .await
+                .map_err(|error| IngestError::Internal(format!("error: root lookup: {error}")))?
+                .ok_or_else(|| {
+                    IngestError::Rejected("invalid: workflow thread root not found".into())
+                })?;
+            if !matches!(root_event.event.kind.as_u16(), 9 | 40002 | 45001 | 45003) {
+                return Err(IngestError::Rejected(
+                    "invalid: workflow thread root must be a message".into(),
+                ));
+            }
+            let destination = channel
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|_| IngestError::Rejected("invalid: destination channel".into()))?
+                .unwrap_or(channel_id);
+            if !state
+                .is_member_cached(tenant.community(), destination, &self_bytes)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: membership check: {e}")))?
+            {
+                return Err(IngestError::Rejected(
+                    "forbidden: not a member of the destination channel".into(),
+                ));
+            }
+            let ancestry = super::ingest::resolve_relay_reply_thread_meta(
+                tenant.community(),
+                root,
+                destination,
+                state,
+            )
+            .await
+            .map_err(|error| {
+                IngestError::Rejected(format!("invalid: workflow thread destination: {error}"))
+            })?;
+            if ancestry.root_hex() != *root {
+                return Err(IngestError::Rejected(
+                    "invalid: thread_root must identify the canonical root".into(),
+                ));
+            }
+        }
+    }
 
     // SEC-006: definitions with exfiltration-capable actions (call_webhook)
     // require elevated channel authority to save — plain membership is not
