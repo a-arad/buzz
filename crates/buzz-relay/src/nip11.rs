@@ -523,6 +523,7 @@ mod tests {
     /// NIP-43 events are verified against `self`; advertising NIP-43 without
     /// `self` would give clients no way to verify membership events. The
     /// debug_assert in `build` catches this in tests/debug builds.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "advertise_nip43=true requires relay_self=Some")]
     fn build_nip43_without_self_panics_in_debug() {
