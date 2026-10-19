@@ -210,11 +210,13 @@ impl ActionSink for RelayActionSink {
         text: &str,
         authored_text: &str,
         author_pubkey: &str,
+        thread_root: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let authored_text = authored_text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
+        let thread_root = thread_root.map(str::to_owned);
 
         Box::pin(async move {
             // 0. Upgrade weak reference — fails only during shutdown.
@@ -303,6 +305,21 @@ impl ActionSink for RelayActionSink {
                     .map_err(|e| ActionSinkError::EventBuild(format!("workflow owner tag: {e}")))?,
             ];
 
+            let root = match thread_root.as_deref() {
+                Some(id) => Some(
+                    crate::workflow_thread::resolve(tenant.community(), id, channel_uuid, &state)
+                        .await
+                        .map_err(ActionSinkError::InvalidInput)?,
+                ),
+                None => None,
+            };
+            if let Some(id) = thread_root.as_deref() {
+                tags.push(
+                    Tag::parse(["e", id, "", "reply"])
+                        .map_err(|e| ActionSinkError::EventBuild(format!("thread tag: {e}")))?,
+                );
+            }
+
             // Rendered mentions retain legacy routing. Only mentions also
             // present in the stored template receive delegated authority.
             let members = state
@@ -354,16 +371,15 @@ impl ActionSink for RelayActionSink {
             );
 
             // 4. Persist event with thread metadata (matches REST handler path).
-            //    Workflow messages are always top-level: depth=0, no parent/root.
             let thread_meta = Some(buzz_db::event::ThreadMetadataParams {
                 event_id: &event_id_bytes,
                 event_created_at,
                 channel_id: channel_uuid,
-                parent_event_id: None,
-                parent_event_created_at: None,
-                root_event_id: None,
-                root_event_created_at: None,
-                depth: 0,
+                parent_event_id: root.as_ref().map(|r| r.id.as_slice()),
+                parent_event_created_at: root.as_ref().map(|r| r.created_at),
+                root_event_id: root.as_ref().map(|r| r.id.as_slice()),
+                root_event_created_at: root.as_ref().map(|r| r.created_at),
+                depth: if root.is_some() { 1 } else { 0 },
                 broadcast: false,
             });
 
@@ -390,6 +406,14 @@ impl ActionSink for RelayActionSink {
                     None,
                 )
                 .await;
+                if let Some(root) = root {
+                    crate::handlers::side_effects::emit_live_thread_summary(
+                        &tenant,
+                        &state,
+                        channel_uuid,
+                        root.id,
+                    );
+                }
             }
 
             Ok(event_id_hex)

@@ -68,5 +68,6 @@ pub trait ActionSink: Send + Sync {
         text: &str,
         authored_text: &str,
         author_pubkey: &str,
+        thread_root: Option<&str>,
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>>;
 }

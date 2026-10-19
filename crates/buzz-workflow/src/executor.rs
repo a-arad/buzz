@@ -403,9 +403,16 @@ pub fn resolve_step_templates(
     };
 
     match &step.action {
-        SendMessage { text, channel } => Ok(SendMessage {
+        SendMessage {
+            text,
+            channel,
+            thread_root,
+            ..
+        } => Ok(SendMessage {
             text: t(text)?,
             channel: t_opt(channel)?,
+            thread_root: thread_root.clone(),
+            reply_in_thread: false,
         }),
         SendDm { to, text } => Ok(SendDm {
             to: t(to)?,
@@ -528,7 +535,12 @@ pub async fn dispatch_action(
     let step_id = &step.id;
 
     match action {
-        SendMessage { text, channel } => {
+        SendMessage {
+            text,
+            channel,
+            thread_root,
+            ..
+        } => {
             // Look up workflow metadata for destination validation and
             // attribution, scoped to the run's community — the same run/workflow
             // UUID may exist in another community, so a bare-id lookup could
@@ -582,6 +594,7 @@ pub async fn dispatch_action(
                     text,
                     authored_text,
                     &owner_pubkey_hex,
+                    thread_root.as_deref(),
                 )
                 .await
                 .map_err(WorkflowError::from)?;
