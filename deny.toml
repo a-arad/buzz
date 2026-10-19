@@ -6,6 +6,21 @@ ignore = [
     # paste 1.0.15 — unmaintained. Transitive dep: mesh-llm → iroh → netlink-* → paste.
     # No safe upgrade available; tracked for upstream (iroh/netlink) replacement.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via mesh-llm → iroh → netlink; no upstream fix available" },
+    # Unmaintained notices only; no patched versions. These do not exempt any
+    # vulnerability advisory. Reachability, migration gates and review dates:
+    # docs/security-dependency-followups.md#dep-001-replace-unsafe-libyaml
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml has no patch replacing unsafe-libyaml; member-authored workflow YAML is production reachable; migrate under DEP-001, review by 2026-10-23" },
+    # docs/security-dependency-followups.md#dep-004-move-mesh-keyring-off-zbus-5
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: dev-only via buzz-mesh-smoke -> mesh-llm 0.76.2 -> keyring 4.2 -> zbus 5; no keyring store on zbus 6 yet; DEP-004, review by 2026-10-23" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: dev-only via buzz-mesh-smoke -> mesh-llm 0.76.2 -> keyring 4.2 -> zbus 5; no keyring store on zbus 6 yet; DEP-004, review by 2026-10-23" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: dev-only via buzz-mesh-smoke -> mesh-llm 0.76.2 -> keyring 4.2 -> zbus 5; no keyring store on zbus 6 yet; DEP-004, review by 2026-10-23" },
+    # Vulnerability advisories. zip is absent from the root build graphs that
+    # DEP-003 lists (default features; desktop and other features/targets are
+    # not covered), and mesh-llm never calls the affected extract() APIs.
+    # docs/security-dependency-followups.md#dep-003-zip-9-via-mesh-llm
+    { id = "RUSTSEC-2026-0367", reason = "zip 8.6 dev-only via buzz-mesh-smoke -> mesh-llm 0.76.2 (^8.6); fix needs zip 9; mesh extracts without unix modes; DEP-003, review by 2026-10-23" },
+    { id = "RUSTSEC-2026-0368", reason = "zip 8.6 dev-only via buzz-mesh-smoke -> mesh-llm 0.76.2 (^8.6); fix needs zip 9; ZipArchive::extract unused; DEP-003, review by 2026-10-23" },
+    { id = "RUSTSEC-2026-0369", reason = "zip 8.6 dev-only via buzz-mesh-smoke -> mesh-llm 0.76.2 (^8.6); fix needs zip 9; extract() unused, no symlinks; DEP-003, review by 2026-10-23" },
     # quick-xml < 0.41: quadratic runtime on duplicate-attribute check (0194) and
     # unbounded namespace-declaration allocation in NsReader (0195). Both DoS-class,
     # requiring attacker-controlled XML. Our two locked versions only parse trusted
