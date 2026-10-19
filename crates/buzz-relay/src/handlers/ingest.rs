@@ -43,7 +43,7 @@ use nostr::Event;
 
 use crate::state::AppState;
 
-use super::event::dispatch_persistent_event;
+use super::event::dispatch_obligated_event;
 
 use crate::conformance::{
     self as conf, channel_label, claimed_community_from_event, emit, msg_id_label,
@@ -277,6 +277,18 @@ pub enum IngestAuth {
         /// How the HTTP request was authenticated.
         auth_method: HttpAuthMethod,
     },
+}
+
+/// The dispatch obligation an ingested event's insert writes: dispatch this
+/// event, audited as the authenticated principal.
+fn dispatch_obligation(
+    event: &Event,
+    auth: &IngestAuth,
+) -> buzz_db::event_dispatch::DispatchObligation {
+    buzz_db::event_dispatch::DispatchObligation::new(
+        event.id.to_bytes(),
+        Some(auth.principal_pubkey_bytes()),
+    )
 }
 
 impl IngestAuth {
@@ -3278,9 +3290,8 @@ async fn ingest_event_inner(
         // the event in the same transaction. Ordering is load-bearing: active
         // duplicate reactions must return before storing a duplicate kind:7 event.
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
-        let (stored_event, was_inserted) = match state
-            .db
-            .insert_reaction_event_with_thread_metadata(
+        let (stored_event, was_inserted) = match dispatch_obligation(&event, &auth)
+            .scope(state.db.insert_reaction_event_with_thread_metadata(
                 tenant.community(),
                 &event,
                 channel_id,
@@ -3288,7 +3299,7 @@ async fn ingest_event_inner(
                 &target_id,
                 &actor_bytes,
                 emoji,
-            )
+            ))
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
         {
@@ -3336,7 +3347,7 @@ async fn ingest_event_inner(
             },
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
-        dispatch_persistent_event(
+        dispatch_obligated_event(
             tenant,
             state,
             &stored_event,
@@ -3364,107 +3375,113 @@ async fn ingest_event_inner(
     };
 
     let workflow_deletion = crate::handlers::side_effects::is_workflow_deletion(&event);
-    let (stored_event, was_inserted) = if workflow_deletion {
-        // A single commit owns public acceptance, domain mutation, and dispatch.
-        // Failure rolls everything back; identical concurrent requests cannot
-        // divide insertion and repair ownership between two relay workers.
-        crate::handlers::side_effects::persist_workflow_deletion(tenant, &event, state)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?
-    } else if buzz_core::kind::is_replaceable(kind_u32) {
-        // NIP-16 replaceable event — atomic replace with stale-write protection.
-        // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
-        state
-            .db
-            .replace_addressable_event(tenant.community(), &event, channel_id)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
-    } else if is_parameterized_replaceable(kind_u32) {
-        // NIP-33 parameterized replaceable — keyed by (kind, pubkey, d_tag).
-        let d_tag = buzz_db::event::extract_d_tag(&event).unwrap_or_default();
-        if d_tag.len() > buzz_db::event::D_TAG_MAX_LEN {
-            return Err(IngestError::Rejected(format!(
-                "invalid: d tag too long ({} bytes, max {})",
-                d_tag.len(),
-                buzz_db::event::D_TAG_MAX_LEN,
-            )));
-        }
-        state
-            .db
-            .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
-    } else if let Some(spec) = canvas_revision_spec.as_ref() {
-        // Canvas write carrying an optimistic-concurrency precondition. Plain
-        // canvas writes (no `expected-revision` tag) fall through to the generic
-        // append path below, preserving unconditional behavior. The channel is
-        // guaranteed present here: KIND_CANVAS requires an `h` tag and step 5b
-        // resolved it into `channel_id`.
-        let channel = channel_id
-            .ok_or_else(|| IngestError::Rejected("invalid: canvas event missing channel".into()))?;
-        let precondition = match spec {
-            CanvasRevisionSpec::NoHead => buzz_db::ChannelHeadPrecondition::ExpectNoHead,
-            CanvasRevisionSpec::Head(id) => buzz_db::ChannelHeadPrecondition::ExpectedHead(id),
-        };
-        let (stored_event, status) = state
-            .db
-            .insert_canvas_head_checked(tenant.community(), &event, channel, precondition)
-            .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
-        match status {
-            buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
-                return Err(IngestError::CanvasConflict(
-                    "conflict: canvas revision does not exist".into(),
-                ));
+    // The insert writes the event's dispatch obligation in its own transaction;
+    // `dispatch_obligated_event` below discharges it.
+    let (stored_event, was_inserted) = dispatch_obligation(&event, &auth)
+        .scope(async {
+            Ok::<_, IngestError>(if workflow_deletion {
+            // A single commit owns public acceptance, domain mutation, and dispatch.
+            // Failure rolls everything back; identical concurrent requests cannot
+            // divide insertion and repair ownership between two relay workers.
+            crate::handlers::side_effects::persist_workflow_deletion(tenant, &event, state)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: workflow deletion failed: {e}")))?
+        } else if buzz_core::kind::is_replaceable(kind_u32) {
+            // NIP-16 replaceable event — atomic replace with stale-write protection.
+            // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
+            state
+                .db
+                .replace_addressable_event(tenant.community(), &event, channel_id)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+        } else if is_parameterized_replaceable(kind_u32) {
+            // NIP-33 parameterized replaceable — keyed by (kind, pubkey, d_tag).
+            let d_tag = buzz_db::event::extract_d_tag(&event).unwrap_or_default();
+            if d_tag.len() > buzz_db::event::D_TAG_MAX_LEN {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: d tag too long ({} bytes, max {})",
+                    d_tag.len(),
+                    buzz_db::event::D_TAG_MAX_LEN,
+                )));
             }
-            buzz_db::ChannelHeadWriteStatus::RevisionMismatch => {
-                return Err(IngestError::CanvasConflict(
-                    "conflict: canvas changed since it was loaded".into(),
-                ));
-            }
-            buzz_db::ChannelHeadWriteStatus::SupersedeFailed => {
-                return Err(IngestError::CanvasConflict(
-                    "conflict: canvas write does not supersede the current head".into(),
-                ));
-            }
-            buzz_db::ChannelHeadWriteStatus::Inserted => (stored_event, true),
-            buzz_db::ChannelHeadWriteStatus::Duplicate => (stored_event, false),
-        }
-    } else {
-        let thread_params = thread_meta.as_ref().map(|m| m.as_params());
-        match state
-            .db
-            .insert_event_with_thread_metadata(
-                tenant.community(),
-                &event,
-                channel_id,
-                thread_params,
-            )
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                // Compensate: if we pre-created a channel for kind:9007,
-                // soft-delete it so no orphaned channel row remains.
-                if let Some(ch_id) = pre_created_channel {
-                    if let Err(re) = state
-                        .db
-                        .soft_delete_channel(tenant.community(), ch_id)
-                        .await
-                    {
-                        warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
-                    }
-                    state.invalidate_channel_deleted(tenant);
+            state
+                .db
+                .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+        } else if let Some(spec) = canvas_revision_spec.as_ref() {
+            // Canvas write carrying an optimistic-concurrency precondition. Plain
+            // canvas writes (no `expected-revision` tag) fall through to the generic
+            // append path below, preserving unconditional behavior. The channel is
+            // guaranteed present here: KIND_CANVAS requires an `h` tag and step 5b
+            // resolved it into `channel_id`.
+            let channel = channel_id
+                .ok_or_else(|| IngestError::Rejected("invalid: canvas event missing channel".into()))?;
+            let precondition = match spec {
+                CanvasRevisionSpec::NoHead => buzz_db::ChannelHeadPrecondition::ExpectNoHead,
+                CanvasRevisionSpec::Head(id) => buzz_db::ChannelHeadPrecondition::ExpectedHead(id),
+            };
+            let (stored_event, status) = state
+                .db
+                .insert_canvas_head_checked(tenant.community(), &event, channel, precondition)
+                .await
+                .map_err(|e| IngestError::Internal(format!("error: {e}")))?;
+            match status {
+                buzz_db::ChannelHeadWriteStatus::RevisionMissing => {
+                    return Err(IngestError::CanvasConflict(
+                        "conflict: canvas revision does not exist".into(),
+                    ));
                 }
-                return Err(match e {
-                    buzz_db::DbError::AuthEventRejected => {
-                        IngestError::Rejected("invalid: AUTH events cannot be stored".into())
-                    }
-                    other => IngestError::Internal(format!("error: database error: {other}")),
-                });
+                buzz_db::ChannelHeadWriteStatus::RevisionMismatch => {
+                    return Err(IngestError::CanvasConflict(
+                        "conflict: canvas changed since it was loaded".into(),
+                    ));
+                }
+                buzz_db::ChannelHeadWriteStatus::SupersedeFailed => {
+                    return Err(IngestError::CanvasConflict(
+                        "conflict: canvas write does not supersede the current head".into(),
+                    ));
+                }
+                buzz_db::ChannelHeadWriteStatus::Inserted => (stored_event, true),
+                buzz_db::ChannelHeadWriteStatus::Duplicate => (stored_event, false),
             }
-        }
-    };
+        } else {
+            let thread_params = thread_meta.as_ref().map(|m| m.as_params());
+            match state
+                .db
+                .insert_event_with_thread_metadata(
+                    tenant.community(),
+                    &event,
+                    channel_id,
+                    thread_params,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    // Compensate: if we pre-created a channel for kind:9007,
+                    // soft-delete it so no orphaned channel row remains.
+                    if let Some(ch_id) = pre_created_channel {
+                        if let Err(re) = state
+                            .db
+                            .soft_delete_channel(tenant.community(), ch_id)
+                            .await
+                        {
+                            warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
+                        }
+                        state.invalidate_channel_deleted(tenant);
+                    }
+                    return Err(match e {
+                        buzz_db::DbError::AuthEventRejected => {
+                            IngestError::Rejected("invalid: AUTH events cannot be stored".into())
+                        }
+                        other => IngestError::Internal(format!("error: database error: {other}")),
+                    });
+                }
+            }
+        })
+        })
+        .await?;
 
     if !was_inserted {
         return Ok(IngestResult {
@@ -3532,7 +3549,7 @@ async fn ingest_event_inner(
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
     }
-    dispatch_persistent_event(
+    dispatch_obligated_event(
         tenant,
         state,
         &stored_event,
@@ -6751,6 +6768,100 @@ mod postgres_tests {
             .await
             .expect("connect test Postgres");
         build_canvas_ingest_state(&db_url, &pool).await
+    }
+
+    /// Ingest writes the event's dispatch obligation in its insert transaction
+    /// and keeps it when a post-commit effect fails: this state's Redis is
+    /// unreachable, so the publish fails. A duplicate submission adds none.
+    /// Mutations: drop the obligation scope in `ingest_event`, or discharge a
+    /// failed pass's obligation → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn ingest_keeps_dispatch_obligation_when_an_effect_fails() {
+        use buzz_db::channel::{ChannelType, ChannelVisibility};
+        use nostr::{Keys, Tag};
+
+        let state = ingest_state().await;
+        let host = format!("dispatch-obligation-{}.test", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("ensure community")
+            .id;
+        let tenant = TenantContext::resolved(community, &host);
+        let author = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        state
+            .db
+            .create_channel_with_id(
+                community,
+                channel_id,
+                &format!("dispatch-{}", channel_id.simple()),
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                author.public_key().to_bytes().as_slice(),
+                None,
+            )
+            .await
+            .expect("create channel");
+        state.membership_cache.insert(
+            (
+                community,
+                channel_id,
+                author.public_key().to_bytes().to_vec(),
+            ),
+            true,
+        );
+        let event = EventBuilder::new(Kind::Custom(9), "owes dispatch")
+            .tags([Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+            .sign_with_keys(&author)
+            .expect("sign post");
+        let auth = || IngestAuth::Http {
+            pubkey: author.public_key(),
+            scopes: vec![Scope::MessagesWrite],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        let obligation = || async {
+            sqlx::query_as::<_, (String, i32, Option<Vec<u8>>)>(
+                "SELECT state, attempts, actor_pubkey FROM event_dispatch_queue \
+                 WHERE community_id = $1 AND event_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .fetch_all(state.db.pool())
+            .await
+            .expect("read obligations")
+        };
+
+        let accepted = ingest_event(&state, &tenant, event.clone(), auth())
+            .await
+            .expect("ingest");
+        assert!(accepted.accepted);
+        // The spawned pass fails fast against the closed Redis port.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            obligation().await,
+            vec![(
+                "pending".to_owned(),
+                0,
+                Some(author.public_key().to_bytes().to_vec())
+            )]
+        );
+
+        let resent = ingest_event(&state, &tenant, event.clone(), auth())
+            .await
+            .expect("resend");
+        assert_eq!(resent.message, "duplicate:");
+        assert_eq!(obligation().await.len(), 1);
+
+        // Leave no due obligation behind for other tests' claims.
+        sqlx::query("DELETE FROM event_dispatch_queue WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(state.db.pool())
+            .await
+            .expect("clean up obligation");
     }
 
     /// An owner's timeout reaches its agent, and it is enforced before command

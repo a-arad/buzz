@@ -18,3 +18,6 @@ CREATE TABLE audit_log (
 );
 
 CREATE UNIQUE INDEX idx_audit_log_hash ON audit_log (community_id, hash);
+-- At most one event_created entry per event: checked under the audit lock.
+CREATE INDEX idx_audit_log_event_created_object
+    ON audit_log (community_id, object_id) WHERE action = 'event_created';

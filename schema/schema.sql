@@ -114,6 +114,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/push_leases.sql
 \i tables/public/push_wake_outbox.sql
 \i tables/public/push_match_queue.sql
+\i tables/public/event_dispatch_queue.sql
 \i tables/public/push_gateway_challenges.sql
 \i tables/public/push_gateway_installations.sql
 \i tables/public/push_gateway_delegations.sql
@@ -166,6 +167,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i triggers/pubkey_allowlist.sql
 \i triggers/push_leases.sql
 \i triggers/push_match_queue.sql
+\i triggers/event_dispatch_queue.sql
 \i triggers/push_wake_outbox.sql
 \i triggers/reactions.sql
 \i triggers/relay_invites.sql

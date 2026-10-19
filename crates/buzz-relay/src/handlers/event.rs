@@ -119,6 +119,30 @@ pub async fn filter_fanout_by_access(
     matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
     threaded: Option<&crate::state::ThreadedChannelVisibility>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
+    filter_fanout_by_access_checked(state, community_id, stored_event, matches, threaded)
+        .await
+        .allowed
+}
+
+/// Recipients kept by [`filter_fanout_by_access`], and whether a failed
+/// visibility or membership lookup dropped any of the others.
+pub(crate) struct FanoutAccess {
+    pub(crate) allowed: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
+    /// A recipient was dropped because its access could not be determined,
+    /// not because it was denied. Delivery still fails closed; a dispatch
+    /// owner keeps its obligation so a later pass can reach that recipient.
+    pub(crate) lookup_failed: bool,
+}
+
+/// [`filter_fanout_by_access`], also reporting recipients dropped by a failed
+/// lookup.
+pub(crate) async fn filter_fanout_by_access_checked(
+    state: &AppState,
+    community_id: CommunityId,
+    stored_event: &StoredEvent,
+    matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
+    threaded: Option<&crate::state::ThreadedChannelVisibility>,
+) -> FanoutAccess {
     // First enforce the receiver-side tenant label. Subscription indexes are
     // community-scoped, but stale/injected matches and future fan-out helpers
     // must still fail closed at the send chokepoint: a connection bound to
@@ -201,7 +225,10 @@ pub async fn filter_fanout_by_access(
     };
 
     let Some(channel_id) = stored_event.channel_id else {
-        return matches;
+        return FanoutAccess {
+            allowed: matches,
+            lookup_failed: false,
+        };
     };
     // Fence 3 (§4.8 phase-2): the threaded value is used only when it was
     // resolved under exactly this (community_id, channel_id); anything else
@@ -217,34 +244,112 @@ pub async fn filter_fanout_by_access(
                 .await
         }
     };
+    #[cfg(test)]
+    let visibility = fanout_lookup_faults::visibility(community_id, channel_id, visibility);
     match visibility {
-        Ok(v) if v != "private" => return matches,
+        Ok(v) if v != "private" => {
+            return FanoutAccess {
+                allowed: matches,
+                lookup_failed: false,
+            }
+        }
         Ok(_) => {}
+        // A deleted channel has no readers: a denial, not a failed lookup.
+        Err(buzz_db::DbError::ChannelNotFound(_)) => {
+            return FanoutAccess {
+                allowed: Vec::new(),
+                lookup_failed: false,
+            }
+        }
         Err(e) => {
             // Fail closed: if we cannot determine visibility, do not leak a
             // possibly-private channel's events.
             warn!(%channel_id, "fan-out access filter: visibility lookup failed: {e}");
-            return Vec::new();
+            return FanoutAccess {
+                lookup_failed: !matches.is_empty(),
+                allowed: Vec::new(),
+            };
         }
     }
 
     let mut allowed = Vec::with_capacity(matches.len());
+    let mut lookup_failed = false;
     for (conn_id, sub_id) in matches {
         let Some(pubkey) = state.conn_manager.pubkey_for_conn(conn_id) else {
             continue;
         };
-        match state
+        let membership = state
             .is_member_cached(community_id, channel_id, &pubkey)
-            .await
-        {
+            .await;
+        #[cfg(test)]
+        let membership = fanout_lookup_faults::membership(community_id, &pubkey, membership);
+        match membership {
             Ok(true) => allowed.push((conn_id, sub_id)),
             Ok(false) => {}
             Err(e) => {
                 warn!(%channel_id, "fan-out access filter: membership lookup failed: {e}");
+                lookup_failed = true;
             }
         }
     }
-    allowed
+    FanoutAccess {
+        allowed,
+        lookup_failed,
+    }
+}
+
+/// Test-only lookup failures for the fan-out access gate, keyed by community
+/// so concurrent tests do not interfere.
+#[cfg(test)]
+pub(crate) mod fanout_lookup_faults {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use buzz_core::CommunityId;
+    use uuid::Uuid;
+
+    /// Lookups that fail for one community.
+    #[derive(Clone, Default)]
+    pub(crate) struct Faults {
+        pub(crate) visibility_of: Vec<Uuid>,
+        pub(crate) membership_of: Vec<Vec<u8>>,
+    }
+
+    static FAULTS: LazyLock<Mutex<HashMap<CommunityId, Faults>>> = LazyLock::new(Default::default);
+
+    pub(crate) fn arm(community: CommunityId, faults: Faults) {
+        FAULTS.lock().unwrap().insert(community, faults);
+    }
+
+    pub(crate) fn clear(community: CommunityId) {
+        FAULTS.lock().unwrap().remove(&community);
+    }
+
+    fn injected() -> buzz_db::DbError {
+        buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut)
+    }
+
+    pub(super) fn visibility(
+        community: CommunityId,
+        channel_id: Uuid,
+        result: Result<String, buzz_db::DbError>,
+    ) -> Result<String, buzz_db::DbError> {
+        match FAULTS.lock().unwrap().get(&community) {
+            Some(f) if f.visibility_of.contains(&channel_id) => Err(injected()),
+            _ => result,
+        }
+    }
+
+    pub(super) fn membership(
+        community: CommunityId,
+        pubkey: &[u8],
+        result: Result<bool, buzz_db::DbError>,
+    ) -> Result<bool, buzz_db::DbError> {
+        match FAULTS.lock().unwrap().get(&community) {
+            Some(f) if f.membership_of.iter().any(|p| p == pubkey) => Err(injected()),
+            _ => result,
+        }
+    }
 }
 
 /// Deliver one event to this relay's local subscribers through the access gate.
@@ -361,6 +466,30 @@ pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pub
     }
 }
 
+/// How a dispatch pass gets the event's `event_created` audit entry recorded.
+pub(crate) enum AuditStep {
+    /// Queue the entry now and wait for it to be recorded.
+    Enqueue,
+    /// The caller already queued it; wait on its receipt. `None` when no
+    /// entry is owed (audit disabled, or a caller that writes none).
+    Enqueued(Option<tokio::sync::oneshot::Receiver<bool>>),
+}
+
+/// How long a dispatch pass waits for its audit entry to be recorded before
+/// counting the audit step as failed. The queued entry is still written; the
+/// next pass finds it recorded.
+const AUDIT_RECEIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Result of one post-commit dispatch pass.
+#[derive(Debug)]
+pub(crate) struct DispatchOutcome {
+    /// Local subscriptions the event was sent to.
+    pub(crate) recipients: usize,
+    /// The first effect that did not complete, if any. A pass with a failure
+    /// leaves the event's dispatch obligation for the recovery worker.
+    pub(crate) failure: Option<&'static str>,
+}
+
 /// Schedule post-commit delivery/side effects for a stored event.
 ///
 /// This intentionally returns after only the bounded audit enqueue has completed:
@@ -370,6 +499,10 @@ pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pub
 /// audit DB is overloaded; the spawned task still runs the same guarded fan-out
 /// path, Redis publish, `mark_local_event` echo dedupe, and delivery metrics as
 /// the former inline path.
+///
+/// For relay-emitted events stored without a dispatch obligation (side-effect
+/// and moderation snapshots). Events stored under one use
+/// [`dispatch_obligated_event`].
 pub(crate) async fn dispatch_persistent_event(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -378,8 +511,55 @@ pub(crate) async fn dispatch_persistent_event(
     actor_pubkey_hex: &str,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
 ) -> usize {
+    schedule_dispatch(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        threaded_visibility,
+        false,
+    )
+    .await
+}
+
+/// [`dispatch_persistent_event`] for an event stored under a dispatch
+/// obligation (`event_dispatch_queue`). The obligation is discharged once the
+/// spawned pass finishes every effect: the audit entry recorded, Redis publish,
+/// local fan-out and workflow runs started. A pass that stops short, or a
+/// crash, leaves it for [`crate::dispatch_recovery`], which runs the dispatch
+/// again.
+pub(crate) async fn dispatch_obligated_event(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    stored_event: &StoredEvent,
+    kind_u32: u32,
+    actor_pubkey_hex: &str,
+    threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
+) -> usize {
+    schedule_dispatch(
+        tenant,
+        state,
+        stored_event,
+        kind_u32,
+        actor_pubkey_hex,
+        threaded_visibility,
+        true,
+    )
+    .await
+}
+
+async fn schedule_dispatch(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    stored_event: &StoredEvent,
+    kind_u32: u32,
+    actor_pubkey_hex: &str,
+    threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
+    obligated: bool,
+) -> usize {
     let event_id_hex = stored_event.event.id.to_hex();
-    enqueue_event_created_audit(
+    let audit_recorded = enqueue_event_created_audit(
         tenant,
         state,
         stored_event,
@@ -396,36 +576,72 @@ pub(crate) async fn dispatch_persistent_event(
 
     metrics::counter!("buzz_post_commit_dispatch_scheduled_total").increment(1);
     tokio::spawn(async move {
-        let recipients = dispatch_persistent_event_inner(
+        let outcome = dispatch_persistent_event_inner(
             &tenant,
             &state,
             &stored_event,
             kind_u32,
             &actor_pubkey_hex,
-            false,
+            AuditStep::Enqueued(audit_recorded),
             threaded_visibility,
+            false,
         )
         .await;
-        debug!(
-            event_id = %event_id_hex,
-            recipients,
-            "post-commit dispatch complete"
-        );
+        if !obligated {
+            return;
+        }
+        match outcome.failure {
+            None => {
+                // A failed delete leaves the obligation to the recovery
+                // worker, whose pass finds every effect already done.
+                if let Err(e) = state
+                    .db
+                    .complete_dispatch(
+                        tenant.community(),
+                        &[stored_event.event.id.as_bytes().to_vec()],
+                    )
+                    .await
+                {
+                    warn!(event_id = %event_id_hex, "dispatch obligation delete failed: {e}");
+                }
+                debug!(
+                    event_id = %event_id_hex,
+                    recipients = outcome.recipients,
+                    "post-commit dispatch complete"
+                );
+            }
+            Some(stage) => {
+                metrics::counter!("buzz_post_commit_dispatch_incomplete_total", "stage" => stage)
+                    .increment(1);
+                warn!(
+                    event_id = %event_id_hex,
+                    stage,
+                    "post-commit dispatch incomplete; obligation left for recovery"
+                );
+            }
+        }
     });
 
     0
 }
 
 /// Run post-commit delivery/side effects for a stored event.
-async fn dispatch_persistent_event_inner(
+///
+/// Safe to run more than once for one event: the audit entry is recorded once,
+/// workflow runs start once per (workflow, event), and a repeated publish or
+/// fan-out only resends an event clients deduplicate by id. `recovered` selects
+/// [`buzz_workflow::WorkflowEngine::on_recovered_event`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dispatch_persistent_event_inner(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     stored_event: &StoredEvent,
     kind_u32: u32,
     actor_pubkey_hex: &str,
-    enqueue_audit: bool,
+    audit: AuditStep,
     threaded_visibility: Option<crate::state::ThreadedChannelVisibility>,
-) -> usize {
+    recovered: bool,
+) -> DispatchOutcome {
     // No `crate::conformance` emit here — the spec doesn't have a
     // separate fan-out action. Acceptance was already recorded at the
     // ingest seam (`crates/buzz-relay/src/handlers/ingest.rs`'s
@@ -433,6 +649,7 @@ async fn dispatch_persistent_event_inner(
     // surfaces as `ReadMessageRows` observations on the subscriber side
     // (read seam in req.rs, emitted by the held-back read-seam diff).
     let event_id_hex = stored_event.event.id.to_hex();
+    let mut failure = None;
 
     let topic = match stored_event.channel_id {
         Some(channel_id) => EventTopic::Channel(channel_id),
@@ -450,12 +667,13 @@ async fn dispatch_persistent_event_inner(
             .local_event_ids
             .invalidate(&(tenant.community(), stored_event.event.id.to_bytes()));
         warn!(event_id = %event_id_hex, "Redis publish failed: {e}");
+        failure = Some("publish");
     }
 
     let matches = state
         .sub_registry
         .fan_out_scoped(tenant.community(), stored_event);
-    let matches = filter_fanout_by_access(
+    let access = filter_fanout_by_access_checked(
         state,
         tenant.community(),
         stored_event,
@@ -463,6 +681,14 @@ async fn dispatch_persistent_event_inner(
         threaded_visibility.as_ref(),
     )
     .await;
+    if access.lookup_failed {
+        // Recipients whose access could not be determined got nothing; keep
+        // the obligation so a later pass reaches them.
+        metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "fanout_access")
+            .increment(1);
+        failure = failure.or(Some("fanout_access"));
+    }
+    let matches = access.allowed;
     metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
     debug!(
         event_id = %event_id_hex,
@@ -477,7 +703,10 @@ async fn dispatch_persistent_event_inner(
             error!(event_id = %event_id_hex, "Failed to serialize event for fan-out: {e}");
             metrics::counter!("buzz_post_commit_dispatch_errors_total", "stage" => "serialize")
                 .increment(1);
-            return 0;
+            return DispatchOutcome {
+                recipients: 0,
+                failure: Some("serialize"),
+            };
         }
     };
     let recipients: Vec<_> = matches
@@ -500,17 +729,35 @@ async fn dispatch_persistent_event_inner(
     // out-of-band index to feed. The old Typesense `index_event` worker and its
     // `search_index_tx` mpsc are gone with the Typesense backend.
 
-    if enqueue_audit {
-        enqueue_event_created_audit(
-            tenant,
-            state,
-            stored_event,
-            kind_u32,
-            actor_pubkey_hex,
-            &event_id_hex,
-        )
-        .await;
-    }
+    let audit_recorded = match audit {
+        // An earlier pass may have recorded the entry. Re-queue it only when
+        // it is missing, so retries add no load to a slow audit queue; the
+        // writer still records it at most once if two passes race here.
+        AuditStep::Enqueue
+            if state.audit_tx.is_some()
+                && matches!(
+                    state
+                        .db
+                        .event_created_audit_recorded(tenant.community(), &event_id_hex)
+                        .await,
+                    Ok(true)
+                ) =>
+        {
+            None
+        }
+        AuditStep::Enqueue => {
+            enqueue_event_created_audit(
+                tenant,
+                state,
+                stored_event,
+                kind_u32,
+                actor_pubkey_hex,
+                &event_id_hex,
+            )
+            .await
+        }
+        AuditStep::Enqueued(receipt) => receipt,
+    };
 
     // Skip workflow triggering for workflow-execution kinds and relay-signed workflow messages.
     let is_relay_workflow_msg = stored_event.event.pubkey == state.relay_keypair.public_key()
@@ -525,36 +772,57 @@ async fn dispatch_persistent_event_inner(
         && !is_relay_workflow_msg
         && kind_u32 != KIND_GIFT_WRAP
     {
-        let workflow_engine = Arc::clone(&state.workflow_engine);
-        let workflow_event = stored_event.clone();
-        let trigger_kind = kind_u32.to_string();
-        let workflow_community_host = tenant.host().to_owned();
         // The event was stored under `tenant.community()`; `StoredEvent` does
         // not carry the community, so pass it explicitly. The same channel UUID
         // can exist in another community — scoping the workflow lookup to this
         // community keeps a colliding channel id in B from triggering A's
         // workflows.
         let workflow_community = tenant.community();
-        tokio::spawn(async move {
-            if let Err(e) = workflow_engine
-                .on_event(workflow_community, &workflow_event)
+        let triggered = if recovered {
+            state
+                .workflow_engine
+                .on_recovered_event(workflow_community, stored_event)
                 .await
-            {
-                tracing::error!(event_id = ?workflow_event.event.id, "Workflow trigger failed: {e}");
-            } else {
-                metrics::counter!(
-                    "buzz_workflow_runs_total",
-                    "trigger" => trigger_kind,
-                    "community" => workflow_community_host
-                )
-                .increment(1);
+        } else {
+            state
+                .workflow_engine
+                .on_event(workflow_community, stored_event)
+                .await
+        };
+        match triggered {
+            Ok(()) => metrics::counter!(
+                "buzz_workflow_runs_total",
+                "trigger" => kind_u32.to_string(),
+                "community" => tenant.host().to_owned()
+            )
+            .increment(1),
+            Err(e) => {
+                tracing::error!(event_id = ?stored_event.event.id, "Workflow trigger failed: {e}");
+                failure = failure.or(Some("workflow"));
             }
-        });
+        }
     }
 
-    matches.len()
+    if let Some(receipt) = audit_recorded {
+        let recorded = matches!(
+            tokio::time::timeout(AUDIT_RECEIPT_TIMEOUT, receipt).await,
+            Ok(Ok(true))
+        );
+        if !recorded {
+            warn!(event_id = %event_id_hex, "event_created audit entry not recorded");
+            failure = failure.or(Some("audit"));
+        }
+    }
+
+    DispatchOutcome {
+        recipients: matches.len(),
+        failure,
+    }
 }
 
+/// Queue the event's `event_created` audit entry, to be recorded at most once.
+/// Returns the receipt the audit worker answers once the entry is in the chain,
+/// or `None` when audit logging is disabled.
 async fn enqueue_event_created_audit(
     tenant: &TenantContext,
     state: &Arc<AppState>,
@@ -562,17 +830,15 @@ async fn enqueue_event_created_audit(
     kind_u32: u32,
     actor_pubkey_hex: &str,
     event_id_hex: &str,
-) {
-    let Some(audit_tx) = &state.audit_tx else {
-        return;
-    };
+) -> Option<tokio::sync::oneshot::Receiver<bool>> {
+    let audit_tx = state.audit_tx.as_ref()?;
     // Audit via bounded channel (capacity 1000). Uses .send().await so entries
     // are never silently dropped — backpressure propagates to the event handler
     // if the queue is full. This is intentional: the audit advisory lock already
     // serializes writes (at most 1 in-flight), so a full queue means the audit
     // DB is genuinely overloaded and the relay should slow down rather than
-    // accumulate unbounded in-memory state. DB write failures in the worker are
-    // logged but not retried (same as the previous per-event tokio::spawn).
+    // accumulate unbounded in-memory state. A failed write answers the receipt
+    // with `false`, which keeps the event's dispatch obligation for a retry.
     let audit_entry = buzz_audit::NewAuditEntry {
         community_id: tenant.community(),
         action: buzz_audit::AuditAction::EventCreated,
@@ -589,10 +855,18 @@ async fn enqueue_event_created_audit(
             "channel_id": stored_event.channel_id,
         }),
     };
-    if let Err(e) = audit_tx.send(audit_entry).await {
+    let (recorded, receipt) = tokio::sync::oneshot::channel();
+    if let Err(e) = audit_tx
+        .send(crate::state::AuditJob::EventCreated {
+            entry: audit_entry,
+            recorded,
+        })
+        .await
+    {
         error!(event_id = %event_id_hex, "Audit channel closed — entry lost: {e}");
         metrics::counter!("buzz_audit_send_errors_total").increment(1);
     }
+    Some(receipt)
 }
 
 /// Handle an EVENT message from a WebSocket connection.
@@ -2133,8 +2407,9 @@ mod tests {
                         &buzz_core::StoredEvent::new(event, None),
                         kind,
                         &author,
-                        false,
+                        super::super::AuditStep::Enqueued(None),
                         None,
+                        false,
                     )
                     .await;
                 }
@@ -2429,8 +2704,9 @@ mod tests {
                 &stored,
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
-                true,
+                super::super::AuditStep::Enqueue,
                 None,
+                false,
             )
             .await;
 
@@ -2459,6 +2735,717 @@ mod tests {
                 signer.public_key().to_bytes().to_vec(),
                 "audit must NOT record the relay signer as the actor"
             );
+        }
+
+        /// A recovery pass runs dispatch again for an event whose earlier pass
+        /// may already have recorded its audit entry: every pass reports the
+        /// entry recorded, and the chain holds it once.
+        #[tokio::test]
+        async fn repeated_dispatch_records_event_created_once() {
+            use buzz_core::event::StoredEvent;
+            use buzz_core::tenant::{CommunityId, TenantContext};
+
+            let Some((state, audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping repeated-dispatch audit test: Postgres/Redis unavailable");
+                return;
+            };
+            let community_uuid = Uuid::new_v4();
+            let host = format!("audit-once-test-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("seed community");
+            let tenant = TenantContext::resolved(CommunityId::from_uuid(community_uuid), host);
+            let actor = Keys::generate();
+            let event = EventBuilder::new(Kind::from(KIND_PRESENCE_UPDATE as u16), "online")
+                .tags([nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow tag")])
+                .sign_with_keys(&state.relay_keypair)
+                .expect("sign relay event");
+            let event_id_hex = event.id.to_hex();
+            let stored = StoredEvent::new(event, None);
+
+            for pass in 0..3 {
+                let outcome = super::super::dispatch_persistent_event_inner(
+                    &tenant,
+                    &state,
+                    &stored,
+                    KIND_PRESENCE_UPDATE,
+                    &actor.public_key().to_hex(),
+                    super::super::AuditStep::Enqueue,
+                    None,
+                    pass > 0,
+                )
+                .await;
+                assert_eq!(outcome.failure, None, "pass {pass} completes every effect");
+            }
+            audit_shutdown
+                .drain(std::time::Duration::from_secs(5))
+                .await;
+
+            let recorded: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_log \
+                 WHERE community_id = $1 AND action = 'event_created' AND object_id = $2",
+            )
+            .bind(community_uuid)
+            .bind(&event_id_hex)
+            .fetch_one(&pool)
+            .await
+            .expect("count audit rows");
+            assert_eq!(recorded, 1);
+        }
+
+        /// Fixture for the dispatch-obligation tests: a community, an open
+        /// channel, and an author the membership cache admits.
+        async fn obligation_fixture(
+            state: &AppState,
+            pool: &sqlx::PgPool,
+            label: &str,
+        ) -> (buzz_core::tenant::TenantContext, Uuid, Keys) {
+            obligation_fixture_with(
+                state,
+                pool,
+                label,
+                buzz_db::channel::ChannelVisibility::Open,
+            )
+            .await
+        }
+
+        async fn obligation_fixture_with(
+            state: &AppState,
+            pool: &sqlx::PgPool,
+            label: &str,
+            visibility: buzz_db::channel::ChannelVisibility,
+        ) -> (buzz_core::tenant::TenantContext, Uuid, Keys) {
+            use buzz_db::channel::ChannelType;
+            let community_uuid = Uuid::new_v4();
+            let host = format!("{label}-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(pool)
+                .await
+                .expect("seed community");
+            let community = buzz_core::CommunityId::from_uuid(community_uuid);
+            let author = Keys::generate();
+            let channel_id = Uuid::new_v4();
+            state
+                .db
+                .create_channel_with_id(
+                    community,
+                    channel_id,
+                    &format!("{label}-{}", channel_id.simple()),
+                    ChannelType::Stream,
+                    visibility,
+                    None,
+                    author.public_key().to_bytes().as_slice(),
+                    None,
+                )
+                .await
+                .expect("create channel");
+            state.membership_cache.insert(
+                (
+                    community,
+                    channel_id,
+                    author.public_key().to_bytes().to_vec(),
+                ),
+                true,
+            );
+            (
+                buzz_core::tenant::TenantContext::resolved(community, host),
+                channel_id,
+                author,
+            )
+        }
+
+        async fn obligation_and_audit_rows(
+            pool: &sqlx::PgPool,
+            tenant: &buzz_core::tenant::TenantContext,
+            event: &nostr::Event,
+        ) -> (i64, i64) {
+            sqlx::query_as(
+                "SELECT (SELECT count(*) FROM event_dispatch_queue \
+                         WHERE community_id = $1 AND event_id = $2), \
+                        (SELECT count(*) FROM audit_log WHERE community_id = $1 \
+                         AND action = 'event_created' AND object_id = $3)",
+            )
+            .bind(tenant.community().as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .bind(event.id.to_hex())
+            .fetch_one(pool)
+            .await
+            .expect("count obligation and audit rows")
+        }
+
+        /// An ingested event's in-process dispatch discharges its obligation
+        /// once every effect is done. Mutation: skip the obligation delete in
+        /// `dispatch_obligated_event` → RED.
+        #[tokio::test]
+        async fn ingested_event_discharges_its_dispatch_obligation() {
+            use crate::handlers::ingest::{ingest_event, HttpAuthMethod, IngestAuth};
+
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping obligation discharge test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-discharge").await;
+            let event = EventBuilder::new(Kind::Custom(9), "discharged in process")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let accepted = ingest_event(
+                &state,
+                &tenant,
+                event.clone(),
+                IngestAuth::Http {
+                    pubkey: author.public_key(),
+                    scopes: vec![buzz_auth::Scope::MessagesWrite],
+                    auth_method: HttpAuthMethod::Nip98,
+                },
+            )
+            .await
+            .expect("ingest");
+            assert!(accepted.accepted);
+
+            let mut rows = (1, 0);
+            for _ in 0..50 {
+                rows = obligation_and_audit_rows(&pool, &tenant, &event).await;
+                if rows == (0, 1) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert_eq!(rows, (0, 1), "obligation discharged, audit entry recorded");
+        }
+
+        /// The recovery worker's pass re-dispatches an obligation a crash left
+        /// behind, discharges it, and records the audit entry once however
+        /// often it runs. Mutations: drop the recovery delete, or re-append
+        /// the audit entry on every pass → RED.
+        #[tokio::test]
+        async fn recovery_pass_discharges_a_left_obligation_once() {
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping recovery pass test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-recovery").await;
+            let event = EventBuilder::new(Kind::Custom(9), "left by a crash")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let actor = author.public_key().to_bytes().to_vec();
+            // Stored under its obligation with no in-process dispatch: the
+            // state a crash right after COMMIT leaves.
+            let (stored, inserted) = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                Some(actor.clone()),
+            )
+            .scope(state.db.insert_event_with_thread_metadata(
+                tenant.community(),
+                &event,
+                Some(channel_id),
+                None,
+            ))
+            .await
+            .expect("insert under obligation");
+            assert!(inserted);
+
+            for pass in 1..=2 {
+                if pass == 2 {
+                    // A second owner whose claim outlived the first pass.
+                    sqlx::query(
+                        "INSERT INTO event_dispatch_queue \
+                         (community_id, event_id, actor_pubkey, next_attempt_at) \
+                         VALUES ($1, $2, $3, now())",
+                    )
+                    .bind(tenant.community().as_uuid())
+                    .bind(event.id.as_bytes().as_slice())
+                    .bind(&actor)
+                    .execute(&pool)
+                    .await
+                    .expect("re-create obligation");
+                }
+                let claim_id = Uuid::new_v4();
+                sqlx::query(
+                    "UPDATE event_dispatch_queue SET state = 'dispatching', claim_id = $3, \
+                     lease_until = now() + interval '1 minute', attempts = attempts + 1 \
+                     WHERE community_id = $1 AND event_id = $2",
+                )
+                .bind(tenant.community().as_uuid())
+                .bind(event.id.as_bytes().as_slice())
+                .bind(claim_id)
+                .execute(&pool)
+                .await
+                .expect("claim obligation");
+                crate::dispatch_recovery::process_batch(
+                    &state,
+                    buzz_db::event_dispatch::ClaimedDispatchBatch {
+                        community: tenant.community(),
+                        claim_id,
+                        jobs: vec![buzz_db::event_dispatch::ClaimedDispatch {
+                            event: stored.clone(),
+                            actor_pubkey: Some(actor.clone()),
+                            attempt: 1,
+                        }],
+                    },
+                )
+                .await;
+                assert_eq!(
+                    obligation_and_audit_rows(&pool, &tenant, &event).await,
+                    (0, 1),
+                    "pass {pass}: obligation discharged, audit entry recorded once"
+                );
+            }
+        }
+
+        /// An authenticated connection in `community` subscribed to kind 9 in
+        /// `channel_id`. Returns the receiver its EVENT frames arrive on.
+        fn subscribed_conn(
+            state: &AppState,
+            community: buzz_core::CommunityId,
+            channel_id: Uuid,
+            pubkey: &[u8],
+        ) -> mpsc::Receiver<axum::extract::ws::Message> {
+            let conn_id = Uuid::new_v4();
+            let (tx, rx) = mpsc::channel(64);
+            state.conn_manager.register(
+                conn_id,
+                tx,
+                mpsc::channel(8).0,
+                mpsc::channel(8).0,
+                None,
+                CancellationToken::new(),
+                community,
+                Arc::new(AtomicU8::new(0)),
+                Arc::new(Mutex::new(HashMap::new())),
+                3,
+                crate::state::CommunityConnectionControl::new(CancellationToken::new()),
+            );
+            state
+                .conn_manager
+                .set_authenticated_pubkey(conn_id, pubkey.to_vec());
+            state.sub_registry.register_scoped(
+                community,
+                conn_id,
+                "obligation-sub".to_string(),
+                vec![nostr::Filter::new().kind(Kind::Custom(9))],
+                Some(channel_id),
+            );
+            rx
+        }
+
+        /// EVENT frames for `event` received so far, accumulated in `seen`.
+        fn frames_for(
+            rx: &mut mpsc::Receiver<axum::extract::ws::Message>,
+            seen: &mut usize,
+            event: &nostr::Event,
+        ) -> usize {
+            let id = event.id.to_hex();
+            while let Ok(message) = rx.try_recv() {
+                if let axum::extract::ws::Message::Text(text) = message {
+                    if text.as_str().contains(&id) {
+                        *seen += 1;
+                    }
+                }
+            }
+            *seen
+        }
+
+        /// Claim `event`'s obligation as a recovery worker would and run one
+        /// recovery pass over it.
+        async fn recover_once(
+            state: &Arc<AppState>,
+            pool: &sqlx::PgPool,
+            tenant: &buzz_core::tenant::TenantContext,
+            stored: &buzz_core::event::StoredEvent,
+            actor: &[u8],
+        ) {
+            let claim_id = Uuid::new_v4();
+            let claimed = sqlx::query(
+                "UPDATE event_dispatch_queue SET state = 'dispatching', claim_id = $3, \
+                 lease_until = now() + interval '1 minute', attempts = attempts + 1 \
+                 WHERE community_id = $1 AND event_id = $2",
+            )
+            .bind(tenant.community().as_uuid())
+            .bind(stored.event.id.as_bytes().as_slice())
+            .bind(claim_id)
+            .execute(pool)
+            .await
+            .expect("claim obligation")
+            .rows_affected();
+            assert_eq!(claimed, 1, "obligation present to claim");
+            crate::dispatch_recovery::process_batch(
+                state,
+                buzz_db::event_dispatch::ClaimedDispatchBatch {
+                    community: tenant.community(),
+                    claim_id,
+                    jobs: vec![buzz_db::event_dispatch::ClaimedDispatch {
+                        event: stored.clone(),
+                        actor_pubkey: Some(actor.to_vec()),
+                        attempt: 1,
+                    }],
+                },
+            )
+            .await;
+        }
+
+        /// Wait for the event's in-process pass to record its audit entry and
+        /// settle its obligation: poll until it is discharged when that is
+        /// `expected`, otherwise give the pass a moment to (wrongly) discharge
+        /// it.
+        async fn await_in_process_pass(
+            pool: &sqlx::PgPool,
+            tenant: &buzz_core::tenant::TenantContext,
+            event: &nostr::Event,
+            expected: (i64, i64),
+        ) -> (i64, i64) {
+            let mut rows = (0, 0);
+            for _ in 0..100 {
+                rows = obligation_and_audit_rows(pool, tenant, event).await;
+                if rows.1 == 1 && (expected.0 != 0 || rows == expected) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if expected.0 != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                rows = obligation_and_audit_rows(pool, tenant, event).await;
+            }
+            rows
+        }
+
+        /// A failed membership lookup during fan-out keeps the event's
+        /// obligation; the recovery pass after the fault clears delivers to
+        /// the member that missed it. Lookups that succeed deliver as before,
+        /// and a genuine non-member gets nothing on any pass. Mutation: treat
+        /// `lookup_failed` as success in `dispatch_persistent_event_inner` →
+        /// RED (obligation discharged, the faulted member never served).
+        #[tokio::test]
+        async fn membership_lookup_failure_keeps_the_obligation() {
+            use crate::handlers::event::fanout_lookup_faults::{self, Faults};
+            use crate::handlers::ingest::{ingest_event, HttpAuthMethod, IngestAuth};
+
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping membership fault test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) = obligation_fixture_with(
+                &state,
+                &pool,
+                "obligation-membership",
+                buzz_db::channel::ChannelVisibility::Private,
+            )
+            .await;
+            let community = tenant.community();
+            let author_pk = author.public_key().to_bytes().to_vec();
+            let (cached, faulted, outsider) = (
+                Keys::generate().public_key().to_bytes().to_vec(),
+                Keys::generate().public_key().to_bytes().to_vec(),
+                Keys::generate().public_key().to_bytes().to_vec(),
+            );
+            for member in [&cached, &faulted] {
+                state
+                    .db
+                    .ensure_user(community, member)
+                    .await
+                    .expect("ensure member");
+                state
+                    .db
+                    .add_member(
+                        community,
+                        channel_id,
+                        member,
+                        buzz_db::channel::MemberRole::Member,
+                        Some(&author_pk),
+                    )
+                    .await
+                    .expect("add member");
+            }
+            state
+                .membership_cache
+                .insert((community, channel_id, cached.clone()), true);
+            let mut cached_rx = subscribed_conn(&state, community, channel_id, &cached);
+            let mut faulted_rx = subscribed_conn(&state, community, channel_id, &faulted);
+            let mut outsider_rx = subscribed_conn(&state, community, channel_id, &outsider);
+            let (mut cached_seen, mut faulted_seen, mut outsider_seen) = (0, 0, 0);
+
+            fanout_lookup_faults::arm(
+                community,
+                Faults {
+                    membership_of: vec![faulted.clone()],
+                    ..Faults::default()
+                },
+            );
+            let event = EventBuilder::new(Kind::Custom(9), "membership lookup fails")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let auth = || IngestAuth::Http {
+                pubkey: author.public_key(),
+                scopes: vec![buzz_auth::Scope::MessagesWrite],
+                auth_method: HttpAuthMethod::Nip98,
+            };
+            assert!(
+                ingest_event(&state, &tenant, event.clone(), auth())
+                    .await
+                    .expect("ingest")
+                    .accepted
+            );
+            assert_eq!(
+                await_in_process_pass(&pool, &tenant, &event, (1, 1)).await,
+                (1, 1),
+                "obligation kept after the failed lookup"
+            );
+            assert_eq!(
+                (
+                    frames_for(&mut cached_rx, &mut cached_seen, &event),
+                    frames_for(&mut faulted_rx, &mut faulted_seen, &event),
+                    frames_for(&mut outsider_rx, &mut outsider_seen, &event),
+                ),
+                (1, 0, 0)
+            );
+
+            fanout_lookup_faults::clear(community);
+            let stored = buzz_core::event::StoredEvent::new(event.clone(), Some(channel_id));
+            recover_once(&state, &pool, &tenant, &stored, &author_pk).await;
+            assert_eq!(
+                obligation_and_audit_rows(&pool, &tenant, &event).await,
+                (0, 1),
+                "recovered: obligation discharged, audit entry recorded once"
+            );
+            assert_eq!(
+                (
+                    frames_for(&mut cached_rx, &mut cached_seen, &event),
+                    frames_for(&mut faulted_rx, &mut faulted_seen, &event),
+                    frames_for(&mut outsider_rx, &mut outsider_seen, &event),
+                ),
+                (2, 1, 0),
+                "faulted member served; resend to the other; non-member never"
+            );
+
+            // With no fault, a genuine non-member's denial is not a failure.
+            let second = EventBuilder::new(Kind::Custom(9), "no fault")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign second post");
+            let (mut c, mut f, mut o) = (0, 0, 0);
+            assert!(
+                ingest_event(&state, &tenant, second.clone(), auth())
+                    .await
+                    .expect("ingest second")
+                    .accepted
+            );
+            assert_eq!(
+                await_in_process_pass(&pool, &tenant, &second, (0, 1)).await,
+                (0, 1),
+                "obligation discharged although the non-member got nothing"
+            );
+            assert_eq!(
+                (
+                    frames_for(&mut cached_rx, &mut c, &second),
+                    frames_for(&mut faulted_rx, &mut f, &second),
+                    frames_for(&mut outsider_rx, &mut o, &second),
+                ),
+                (1, 1, 0)
+            );
+        }
+
+        /// A failed visibility lookup during fan-out keeps the event's
+        /// obligation. Workflow messages take this path: their dispatch
+        /// resolves visibility fresh. Mutation: treat `lookup_failed` as
+        /// success → RED.
+        #[tokio::test]
+        async fn visibility_lookup_failure_keeps_the_obligation() {
+            use crate::handlers::event::fanout_lookup_faults::{self, Faults};
+
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping visibility fault test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-visibility").await;
+            let community = tenant.community();
+            let author_pk = author.public_key().to_bytes().to_vec();
+            let reader = Keys::generate().public_key().to_bytes().to_vec();
+            let mut reader_rx = subscribed_conn(&state, community, channel_id, &reader);
+            let mut seen = 0;
+
+            fanout_lookup_faults::arm(
+                community,
+                Faults {
+                    visibility_of: vec![channel_id],
+                    ..Faults::default()
+                },
+            );
+            let event = EventBuilder::new(Kind::Custom(9), "visibility lookup fails")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let (stored, inserted) = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                Some(author_pk.clone()),
+            )
+            .scope(state.db.insert_event_with_thread_metadata(
+                community,
+                &event,
+                Some(channel_id),
+                None,
+            ))
+            .await
+            .expect("insert under obligation");
+            assert!(inserted);
+            super::super::dispatch_obligated_event(
+                &tenant,
+                &state,
+                &stored,
+                9,
+                &hex::encode(&author_pk),
+                None,
+            )
+            .await;
+            assert_eq!(
+                await_in_process_pass(&pool, &tenant, &event, (1, 1)).await,
+                (1, 1),
+                "obligation kept after the failed lookup"
+            );
+            assert_eq!(frames_for(&mut reader_rx, &mut seen, &event), 0);
+
+            fanout_lookup_faults::clear(community);
+            recover_once(&state, &pool, &tenant, &stored, &author_pk).await;
+            assert_eq!(
+                obligation_and_audit_rows(&pool, &tenant, &event).await,
+                (0, 1)
+            );
+            assert_eq!(frames_for(&mut reader_rx, &mut seen, &event), 1);
+        }
+
+        /// A deleted channel is a denial, not a failed lookup: its event's
+        /// obligation is discharged with no copies sent. Mutation: count
+        /// `ChannelNotFound` as `lookup_failed` → RED (obligation kept).
+        #[tokio::test]
+        async fn deleted_channel_discharges_the_obligation() {
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping deleted channel test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-deleted-channel").await;
+            let community = tenant.community();
+            let author_pk = author.public_key().to_bytes().to_vec();
+            let reader = Keys::generate().public_key().to_bytes().to_vec();
+            let mut reader_rx = subscribed_conn(&state, community, channel_id, &reader);
+            let mut seen = 0;
+            let event = EventBuilder::new(Kind::Custom(9), "channel deleted before dispatch")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let (stored, inserted) = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                Some(author_pk.clone()),
+            )
+            .scope(state.db.insert_event_with_thread_metadata(
+                community,
+                &event,
+                Some(channel_id),
+                None,
+            ))
+            .await
+            .expect("insert under obligation");
+            assert!(inserted);
+            sqlx::query(
+                "UPDATE channels SET deleted_at = now() WHERE community_id = $1 AND id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(channel_id)
+            .execute(&pool)
+            .await
+            .expect("delete channel");
+            super::super::dispatch_obligated_event(
+                &tenant,
+                &state,
+                &stored,
+                9,
+                &hex::encode(&author_pk),
+                None,
+            )
+            .await;
+            assert_eq!(
+                await_in_process_pass(&pool, &tenant, &event, (0, 1)).await,
+                (0, 1),
+                "obligation discharged"
+            );
+            assert_eq!(frames_for(&mut reader_rx, &mut seen, &event), 0);
+        }
+
+        /// A community that is archived when recovery claims its obligations
+        /// keeps them: archiving can be undone, so they back off toward
+        /// `held` instead of being dropped. Mutation: delete the batch when
+        /// the host lookup finds no served community → RED.
+        #[tokio::test]
+        async fn archived_community_keeps_its_obligations() {
+            let Some((state, _audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping archived community test: Postgres/Redis unavailable");
+                return;
+            };
+            let (tenant, channel_id, author) =
+                obligation_fixture(&state, &pool, "obligation-archived").await;
+            let community = tenant.community();
+            let author_pk = author.public_key().to_bytes().to_vec();
+            let event = EventBuilder::new(Kind::Custom(9), "community archived before recovery")
+                .tags([nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag")])
+                .sign_with_keys(&author)
+                .expect("sign post");
+            let (stored, inserted) = buzz_db::event_dispatch::DispatchObligation::new(
+                event.id.to_bytes(),
+                Some(author_pk.clone()),
+            )
+            .scope(state.db.insert_event_with_thread_metadata(
+                community,
+                &event,
+                Some(channel_id),
+                None,
+            ))
+            .await
+            .expect("insert under obligation");
+            assert!(inserted);
+            sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+                .bind(community.as_uuid())
+                .execute(&pool)
+                .await
+                .expect("archive community");
+            recover_once(&state, &pool, &tenant, &stored, &author_pk).await;
+            let kept: Option<(String, i32, Option<String>)> = sqlx::query_as(
+                "SELECT state, attempts, last_error FROM event_dispatch_queue \
+                 WHERE community_id = $1 AND event_id = $2",
+            )
+            .bind(community.as_uuid())
+            .bind(event.id.as_bytes().as_slice())
+            .fetch_optional(&pool)
+            .await
+            .expect("read obligation");
+            assert_eq!(
+                kept,
+                Some((
+                    "pending".to_owned(),
+                    1,
+                    Some("community not served".to_owned())
+                ))
+            );
+            sqlx::query("DELETE FROM event_dispatch_queue WHERE community_id = $1")
+                .bind(community.as_uuid())
+                .execute(&pool)
+                .await
+                .expect("clean up obligation");
         }
 
         /// Integrated isolation: a community resolved from the request's
@@ -2531,8 +3518,9 @@ mod tests {
                 &a_stored,
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
-                true,
+                super::super::AuditStep::Enqueue,
                 None,
+                false,
             )
             .await;
             super::super::dispatch_persistent_event_inner(
@@ -2541,8 +3529,9 @@ mod tests {
                 &b_stored,
                 KIND_PRESENCE_UPDATE,
                 &actor_hex,
-                true,
+                super::super::AuditStep::Enqueue,
                 None,
+                false,
             )
             .await;
 

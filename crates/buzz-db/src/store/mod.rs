@@ -20,6 +20,11 @@ pub mod deletion;
 pub mod dm;
 /// Event storage and retrieval.
 pub mod event;
+/// Durable post-commit dispatch obligations for accepted events.
+pub mod event_dispatch;
+
+#[cfg(test)]
+mod event_dispatch_postgres_tests;
 /// App-owned push enqueue and channel TTL refresh for inserted events.
 pub(crate) mod event_follow_up;
 

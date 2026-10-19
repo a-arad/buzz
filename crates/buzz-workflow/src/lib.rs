@@ -143,8 +143,11 @@ impl WorkflowEngine {
     ///   (`call_webhook`), the owner must currently hold the `owner` or
     ///   `admin` role.
     ///
-    /// Any lookup error denies (fail-closed): a removed owner must never keep
-    /// exfiltration authority because a membership read happened to fail.
+    /// Any error denies (fail-closed): a removed owner must never keep
+    /// exfiltration authority because a membership read happened to fail. A
+    /// failed lookup returns [`WorkflowError::Database`] rather than
+    /// [`WorkflowError::Unauthorized`], so a caller that can retry later may
+    /// tell it apart from a decided denial.
     pub async fn check_owner_authority(
         &self,
         community_id: CommunityId,
@@ -157,9 +160,7 @@ impl WorkflowEngine {
             .get_member_role(community_id, channel_id, owner_pubkey)
             .await
             .map_err(|e| {
-                WorkflowError::Unauthorized(format!(
-                    "owner authority lookup failed (fail-closed): {e}"
-                ))
+                WorkflowError::Database(format!("owner authority lookup failed (fail-closed): {e}"))
             })?;
         if owner_authority_allows(role.as_deref(), def.requires_elevated_authority()) {
             Ok(())
@@ -317,10 +318,40 @@ impl WorkflowEngine {
     ///
     /// The method takes `self: &Arc<Self>` so that the spawned task can hold a
     /// clone of the `Arc` without requiring `'static` on `&self`.
+    ///
+    /// Returns once every matching run exists and was claimed for execution;
+    /// the executions themselves are spawned. An event has at most one run per
+    /// workflow, so calling this again for the same event starts nothing that
+    /// already started. Returns an error when a matching workflow could not be
+    /// evaluated or its run could not be created or claimed, so the caller can
+    /// keep its dispatch obligation and retry.
     pub async fn on_event(
         self: &Arc<Self>,
         community_id: CommunityId,
         event: &buzz_core::StoredEvent,
+    ) -> Result<(), WorkflowError> {
+        self.trigger_event(community_id, event, false).await
+    }
+
+    /// [`Self::on_event`] for an event whose earlier dispatch may have stopped
+    /// part way. Workflows are read from the database, bypassing the cache,
+    /// and matched and authority-checked against that read. A run reserved by
+    /// the earlier dispatch that never started is executed if its workflow
+    /// still matches, and cancelled otherwise. A run that already started is
+    /// never executed again.
+    pub async fn on_recovered_event(
+        self: &Arc<Self>,
+        community_id: CommunityId,
+        event: &buzz_core::StoredEvent,
+    ) -> Result<(), WorkflowError> {
+        self.trigger_event(community_id, event, true).await
+    }
+
+    async fn trigger_event(
+        self: &Arc<Self>,
+        community_id: CommunityId,
+        event: &buzz_core::StoredEvent,
+        recovered: bool,
     ) -> Result<(), WorkflowError> {
         let Some(channel_id) = event.channel_id else {
             tracing::debug!(
@@ -339,7 +370,16 @@ impl WorkflowEngine {
         }
 
         let cache_key = (community_id, channel_id);
-        let workflows = match self.workflow_cache.get(&cache_key) {
+        // A recovery pass reads the current definitions, not this replica's
+        // cache: another replica may have edited or disabled a workflow since
+        // the entry was filled. The read happens once, before any claim, so an
+        // edit that commits after it is first seen by the next pass.
+        let cached = if recovered {
+            None
+        } else {
+            self.workflow_cache.get(&cache_key)
+        };
+        let workflows = match cached {
             Some(cached) => cached,
             None => {
                 let fresh = Arc::new(
@@ -353,7 +393,7 @@ impl WorkflowEngine {
             }
         };
 
-        if workflows.is_empty() {
+        if workflows.is_empty() && !recovered {
             return Ok(());
         }
 
@@ -367,6 +407,10 @@ impl WorkflowEngine {
             }
         };
 
+        let trigger_event_id = event.event.id.as_bytes().to_vec();
+        // Workflows whose run this dispatch keeps: started, or left for a retry.
+        let mut kept = Vec::new();
+        let mut retry = None;
         for workflow in workflows.iter() {
             let def: WorkflowDef = match serde_json::from_value(workflow.definition.clone()) {
                 Ok(d) => d,
@@ -390,55 +434,109 @@ impl WorkflowEngine {
             // event — this per-fire gate is the authoritative, fail-closed
             // check that a removed (or under-privileged, for exfiltration
             // definitions) owner cannot cause a run.
-            if let Err(e) = self
+            match self
                 .check_owner_authority(community_id, channel_id, &workflow.owner_pubkey, &def)
                 .await
             {
-                tracing::warn!(
-                    workflow_id = %workflow.id,
-                    "Skipping workflow — owner authority check failed: {e}"
-                );
-                continue;
+                Ok(()) => {}
+                // A failed lookup is not a denial: keep the run and retry.
+                Err(e @ WorkflowError::Database(_)) => {
+                    tracing::warn!(
+                        workflow_id = %workflow.id,
+                        "Owner authority lookup failed; workflow left for retry: {e}"
+                    );
+                    kept.push(workflow.id);
+                    retry = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        workflow_id = %workflow.id,
+                        "Skipping workflow — owner authority check failed: {e}"
+                    );
+                    continue;
+                }
             }
 
-            let trigger_event_id_bytes = event.event.id.as_bytes().to_vec();
-            let run_id = match self
-                .db
-                .create_workflow_run(
+            kept.push(workflow.id);
+            if let Err(e) = self
+                .start_event_run(
                     community_id,
                     workflow.id,
-                    Some(&trigger_event_id_bytes),
-                    Some(&trigger_ctx_json),
+                    &trigger_event_id,
+                    &trigger_ctx_json,
+                    &def,
+                    &trigger_ctx,
                 )
                 .await
             {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::error!(workflow_id = %workflow.id, "Failed to create run: {e}");
-                    continue;
-                }
-            };
-
-            tracing::debug!(
-                workflow_id = %workflow.id,
-                run_id = %run_id,
-                "Workflow triggered — spawning execution"
-            );
-
-            let engine = Arc::clone(self);
-            let def_clone = def.clone();
-            let ctx_clone = trigger_ctx.clone();
-
-            tokio::spawn(async move {
-                let result =
-                    executor::execute_run(&engine, community_id, run_id, &def_clone, &ctx_clone)
-                        .await;
-                engine
-                    .finalize_run(community_id, run_id, result, None)
-                    .await;
-            });
+                tracing::error!(workflow_id = %workflow.id, "Failed to start run: {e}");
+                retry = Some(e);
+            }
         }
 
+        if recovered {
+            self.db
+                .cancel_unselected_pending_runs(community_id, &trigger_event_id, &kept)
+                .await?;
+        }
+        retry.map_or(Ok(()), Err)
+    }
+
+    /// Create this event's run of `workflow_id`, or find the one an earlier
+    /// dispatch created, and spawn its execution if this call moves it from
+    /// `pending` to `running`. A run that already started, finished or was
+    /// cancelled is left alone: its actions never run twice.
+    async fn start_event_run(
+        self: &Arc<Self>,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        trigger_event_id: &[u8],
+        trigger_ctx_json: &serde_json::Value,
+        def: &WorkflowDef,
+        trigger_ctx: &executor::TriggerContext,
+    ) -> Result<(), WorkflowError> {
+        let run_id = self
+            .db
+            .create_workflow_run(
+                community_id,
+                workflow_id,
+                Some(trigger_event_id),
+                Some(trigger_ctx_json),
+            )
+            .await?;
+        if !self.db.claim_workflow_run(community_id, run_id).await? {
+            tracing::debug!(
+                workflow_id = %workflow_id,
+                run_id = %run_id,
+                "Workflow run already started for this event — not executing again"
+            );
+            return Ok(());
+        }
+
+        tracing::debug!(
+            workflow_id = %workflow_id,
+            run_id = %run_id,
+            "Workflow triggered — spawning execution"
+        );
+
+        let engine = Arc::clone(self);
+        let def_clone = def.clone();
+        let ctx_clone = trigger_ctx.clone();
+
+        tokio::spawn(async move {
+            let result = executor::execute_claimed_run(
+                &engine,
+                community_id,
+                run_id,
+                &def_clone,
+                &ctx_clone,
+            )
+            .await;
+            engine
+                .finalize_run(community_id, run_id, result, None)
+                .await;
+        });
         Ok(())
     }
 
@@ -2018,6 +2116,66 @@ steps:
             1,
             "no new run may be created after the owner lost membership"
         );
+    }
+
+    /// A recovery pass selects workflows from the database, not from this
+    /// replica's cache: another replica can disable a workflow while the
+    /// entry here is still warm. Mutation: read the cache on recovery → RED.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn recovered_event_selects_past_a_warm_cache() {
+        let db = setup_db().await;
+        let creator = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let member = nostr::Keys::generate().public_key().to_bytes().to_vec();
+        let (community, channel_id) = setup_channel(&db, &creator, &member).await;
+        let def_json = serde_json::json!({
+            "name": "recovery-selection",
+            "trigger": {"on": "message_posted"},
+            "steps": [{"id": "s1", "action": "send_message", "text": "hi"}],
+            "enabled": true,
+        })
+        .to_string();
+        let workflow_id = db
+            .create_workflow(
+                community,
+                Some(channel_id),
+                &member,
+                "recovery-selection",
+                &def_json,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+        let engine = Arc::new(WorkflowEngine::new(db.clone(), WorkflowConfig::default()));
+        let runs = || async {
+            db.list_workflow_runs(community, workflow_id, 10)
+                .await
+                .expect("list runs")
+                .len()
+        };
+
+        // Fills this replica's cache with the enabled workflow.
+        engine
+            .on_event(community, &message_event(channel_id))
+            .await
+            .expect("warm cache");
+        assert_eq!(runs().await, 1);
+
+        // Another replica disables it; nothing invalidates this cache.
+        db.set_workflow_enabled(community, workflow_id, false)
+            .await
+            .expect("disable workflow");
+        engine
+            .on_event(community, &message_event(channel_id))
+            .await
+            .expect("live event");
+        assert_eq!(runs().await, 2, "a live event still uses the warm cache");
+
+        engine
+            .on_recovered_event(community, &message_event(channel_id))
+            .await
+            .expect("recovered event");
+        assert_eq!(runs().await, 2, "recovery sees the workflow disabled");
     }
 
     /// Exfiltration-capable definitions (call_webhook) require the owner to
