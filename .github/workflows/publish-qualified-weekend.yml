@@ -1,0 +1,44 @@
+name: Publish qualified weekend relay
+
+on:
+  push:
+    branches: [codex/publish-qualified-weekend]
+    paths: [.github/workflows/publish-qualified-weekend.yml]
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.repository == 'a-arad/buzz'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # GitHub requires write access to read a draft release asset.
+      packages: write
+    env:
+      IMAGE: ghcr.io/a-arad/buzz:axes-relay-v0.2.1-weekend-dispatch-d84fac11
+      EXPECTED: sha256:4ce3880dc8d7fa3e7c0a63cbb4e723b13d5cb629684162b0317859f375b7b490
+    steps:
+      - name: Download the immutable, already qualified OCI archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api -H 'Accept: application/octet-stream' repos/a-arad/buzz/releases/assets/656450742 > relay-image.tar
+          echo '89f0d31e9291e5ad0254b7ce29bf1002eeb5b8ce40e9d6aaf267b08cdf391796  relay-image.tar' | sha256sum --check
+      - name: Publish without rebuilding or changing the tested manifest
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq skopeo
+          export REGISTRY_AUTH_FILE="$RUNNER_TEMP/qualified-relay-auth.json"
+          trap 'rm -f "$REGISTRY_AUTH_FILE"' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | skopeo login --authfile "$REGISTRY_AUTH_FILE" --username "$GITHUB_REPOSITORY_OWNER" --password-stdin ghcr.io
+          skopeo copy --preserve-digests --authfile "$REGISTRY_AUTH_FILE" oci-archive:relay-image.tar "docker://$IMAGE"
+          printf '{"auths":{}}' > "$RUNNER_TEMP/anonymous-auth.json"
+          skopeo inspect --raw --authfile "$RUNNER_TEMP/anonymous-auth.json" "docker://$IMAGE" > published-manifest.json
+          actual="sha256:$(sha256sum published-manifest.json | cut -d ' ' -f 1)"
+          test "$actual" = "$EXPECTED"
+          printf 'Published and anonymously verified `%s@%s`\n' "$IMAGE" "$actual" >> "$GITHUB_STEP_SUMMARY"
