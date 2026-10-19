@@ -1111,7 +1111,7 @@ pub struct ThreadMetadataParams<'a> {
     pub broadcast: bool,
 }
 
-async fn insert_event_with_thread_metadata_tx(
+pub(crate) async fn insert_event_with_thread_metadata_tx(
     tx: &mut Transaction<'_, Postgres>,
     community_id: CommunityId,
     event: &Event,
@@ -1165,6 +1165,9 @@ async fn insert_event_with_thread_metadata_tx(
     let was_inserted = result.rows_affected() > 0;
 
     if was_inserted {
+        crate::event_dispatch::enqueue_for_admitted_insert(tx, community_id, id_bytes.as_slice())
+            .await?;
+
         if let Some(ref meta) = thread_meta {
             let broadcast_val: bool = meta.broadcast;
 

@@ -315,24 +315,35 @@ pub(crate) async fn run_demo_echo(
     tracing::info!(%session_id, %peer, "mesh demo echo: session open");
     let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
-        let frame = tokio::select! {
-            _ = drain_tick.tick() => {
-                if shutting_down.load(Ordering::Relaxed) {
-                    if let Some(community_id) = stream.community_id() {
-                        if let Err(e) = stream.send_goodbye(community_id, GoodbyeReason::Draining).await {
-                            tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
-                        } else {
-                            tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+        let frame = {
+            let receive = stream.recv_validated(&directory);
+            tokio::pin!(receive);
+            loop {
+                tokio::select! {
+                    _ = drain_tick.tick() => {
+                        if shutting_down.load(Ordering::Relaxed) {
+                            break None;
                         }
-                    } else {
-                        let _ = stream.finish();
-                        tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
                     }
-                    return;
+                    frame = &mut receive => break Some(frame),
                 }
-                continue;
             }
-            frame = stream.recv_validated(&directory) => frame,
+        };
+        let Some(frame) = frame else {
+            if let Some(community_id) = stream.community_id() {
+                if let Err(e) = stream
+                    .send_goodbye(community_id, GoodbyeReason::Draining)
+                    .await
+                {
+                    tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
+                } else {
+                    tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
+                }
+            } else {
+                let _ = stream.finish();
+                tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
+            }
+            return;
         };
         match frame {
             Ok(Some(ReliableFrame::Data(payload))) => {
@@ -578,6 +589,56 @@ mod tests {
 
     fn stub_stream() -> MeshStream {
         MeshStream::new(Box::new(StubSend), Box::new(StubRecv))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demo_echo_keeps_pending_receive_across_drain_ticks() {
+        struct PendingRecv {
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+            done: Arc<tokio::sync::Notify>,
+        }
+        impl StreamRecvHalf for PendingRecv {
+            fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    self.done.notified().await;
+                    Ok(None)
+                })
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = Arc::new(tokio::sync::Notify::new());
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:1")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .unwrap();
+        let fenced = FencedHeader {
+            session_id: uuid::Uuid::new_v4(),
+            generation: 1,
+            owner_runtime_id: rid(1),
+        };
+        let inbound = ReliableInbound {
+            fenced,
+            from: rid(2),
+            stream: crate::tunnel::reliable::ReliableMeshStream::new_inbound(
+                fenced,
+                MeshStream::new(
+                    Box::new(StubSend),
+                    Box::new(PendingRecv {
+                        calls: Arc::clone(&calls),
+                        done: Arc::clone(&done),
+                    }),
+                ),
+            ),
+        };
+        let task = tokio::spawn(run_demo_echo(
+            SessionDirectory::new(pool),
+            inbound,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        done.notify_one();
+        task.await.unwrap();
     }
 
     fn rid(byte: u8) -> RuntimeId {

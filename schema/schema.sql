@@ -401,6 +401,10 @@ CREATE TABLE workflow_runs (
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (community_id, workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (community_id, status);
+-- At most one run per (workflow, triggering event); see migration 0058.
+CREATE UNIQUE INDEX idx_workflow_runs_trigger_event
+    ON workflow_runs (community_id, trigger_event_id, workflow_id)
+    WHERE trigger_event_id IS NOT NULL;
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
 -- token-hash lookup scoped: approval token grants cannot act on another
@@ -652,6 +656,9 @@ CREATE TABLE audit_log (
 );
 
 CREATE UNIQUE INDEX idx_audit_log_hash ON audit_log (community_id, hash);
+-- At most one event_created entry per event: checked under the audit lock.
+CREATE INDEX idx_audit_log_event_created_object
+    ON audit_log (community_id, object_id) WHERE action = 'event_created';
 
 -- ── NIP-56 reports (kind:1984 ingest) ─────────────────────────────────────────
 -- One row per accepted report event. Reports are signals, never triggers:
@@ -863,6 +870,30 @@ CREATE INDEX push_match_queue_due
     ON push_match_queue (next_attempt_at, created_at) WHERE state = 'pending';
 CREATE INDEX push_match_queue_recovery
     ON push_match_queue (lease_until) WHERE state = 'matching';
+
+-- Durable owner for the post-commit dispatch of an accepted event: the
+-- event_created audit entry, Redis publish, local fan-out and workflow runs.
+-- Written in the event's insert transaction, deleted once every effect is done,
+-- and re-dispatched by the recovery worker otherwise.
+CREATE TABLE event_dispatch_queue (
+    community_id UUID NOT NULL REFERENCES communities(id),
+    event_id BYTEA NOT NULL CHECK (length(event_id) = 32),
+    -- Audit actor resolved at ingest: the authenticated principal, or the
+    -- triggering user for workflow posts. Not derivable from the event.
+    actor_pubkey BYTEA,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'dispatching', 'held')),
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    next_attempt_at TIMESTAMPTZ NOT NULL,
+    lease_until TIMESTAMPTZ,
+    claim_id UUID,
+    last_error TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (community_id, event_id)
+);
+CREATE INDEX event_dispatch_queue_due
+    ON event_dispatch_queue (next_attempt_at) WHERE state = 'pending';
+CREATE INDEX event_dispatch_queue_recovery
+    ON event_dispatch_queue (lease_until) WHERE state = 'dispatching';
 
 -- T1b push gate (keep in sync with migrations/0023). Enqueue only when the
 -- community has an active, endpoint-enabled, unexpired lease; the shared

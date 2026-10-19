@@ -433,7 +433,7 @@ pub async fn upload_blob(
     if let Some(audit_tx) = &state.audit_tx {
         let desc = descriptor.clone();
         if let Err(e) = audit_tx
-            .send(NewAuditEntry {
+            .send(crate::state::AuditJob::Entry(NewAuditEntry {
                 community_id: auth.tenant.community(),
                 action: AuditAction::MediaUploaded,
                 actor_pubkey: Some(auth.auth_event.pubkey.to_bytes().to_vec()),
@@ -443,7 +443,7 @@ pub async fn upload_blob(
                     "size": desc.size,
                     "mime": desc.mime_type,
                 }),
-            })
+            }))
             .await
         {
             tracing::error!("Media audit channel closed — entry lost: {e}");

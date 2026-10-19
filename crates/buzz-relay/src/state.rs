@@ -644,7 +644,7 @@ pub struct AppState {
     pub channel_visibility_cache: Arc<moka::sync::Cache<(CommunityId, Uuid), String>>,
 
     /// Bounded channel for audit logging, absent when audit logging is disabled.
-    pub audit_tx: Option<mpsc::Sender<buzz_audit::NewAuditEntry>>,
+    pub audit_tx: Option<mpsc::Sender<AuditJob>>,
     /// Media storage client (S3/MinIO).
     pub media_storage: Arc<MediaStorage>,
     /// Single-flight + cache state for the hourly S3 storage sweep. See
@@ -743,7 +743,7 @@ impl AppState {
         let search_arc = Arc::new(search);
 
         let audit_arc = audit.into().map(Arc::new);
-        let (audit_tx, mut audit_rx) = mpsc::channel::<buzz_audit::NewAuditEntry>(1000);
+        let (audit_tx, mut audit_rx) = mpsc::channel::<AuditJob>(1000);
         let audit_for_worker = audit_arc.clone();
         let audit_cancel = CancellationToken::new();
         let audit_cancel_worker = audit_cancel.clone();
@@ -1287,15 +1287,60 @@ impl AuditShutdownHandle {
     }
 }
 
-/// Log a single audit entry with metrics. Extracted so the normal loop
-/// and the post-cancel drain share the same logic.
-async fn log_audit_entry(audit: &buzz_audit::AuditService, entry: buzz_audit::NewAuditEntry) {
+/// One write queued for the audit worker.
+#[derive(Debug)]
+pub enum AuditJob {
+    /// Append an entry.
+    Entry(buzz_audit::NewAuditEntry),
+    /// Record an accepted event's `event_created` entry at most once, then
+    /// report whether it is recorded. Post-commit dispatch may run more than
+    /// once for an event, and keeps its obligation until this reports `true`.
+    EventCreated {
+        /// The `event_created` entry; `object_id` is the event id.
+        entry: buzz_audit::NewAuditEntry,
+        /// Receives `true` once the entry is in the chain, `false` on failure.
+        recorded: tokio::sync::oneshot::Sender<bool>,
+    },
+}
+
+/// Run one audit job. Shared by the normal loop and the post-cancel drain.
+async fn log_audit_entry(audit: &buzz_audit::AuditService, job: AuditJob) {
+    match job {
+        AuditJob::Entry(entry) => {
+            append_audit_entry(audit, entry, false).await;
+        }
+        AuditJob::EventCreated { entry, recorded } => {
+            let ok = append_audit_entry(audit, entry, true).await;
+            // The dispatcher may have given up waiting; nothing to report then.
+            let _ = recorded.send(ok);
+        }
+    }
+}
+
+/// Append one entry with metrics. With `once`, an entry for the same action
+/// and object already in the chain counts as written. Returns whether the
+/// entry is in the chain.
+async fn append_audit_entry(
+    audit: &buzz_audit::AuditService,
+    entry: buzz_audit::NewAuditEntry,
+    once: bool,
+) -> bool {
     let t = std::time::Instant::now();
-    if let Err(e) = audit.log(entry).await {
-        metrics::counter!("buzz_audit_log_errors_total").increment(1);
-        tracing::error!("Audit log failed: {e}");
+    let result = if once {
+        audit.log_once(entry).await.map(|_| ())
     } else {
-        metrics::histogram!("buzz_audit_log_seconds").record(t.elapsed().as_secs_f64());
+        audit.log(entry).await.map(|_| ())
+    };
+    match result {
+        Ok(()) => {
+            metrics::histogram!("buzz_audit_log_seconds").record(t.elapsed().as_secs_f64());
+            true
+        }
+        Err(e) => {
+            metrics::counter!("buzz_audit_log_errors_total").increment(1);
+            tracing::error!("Audit log failed: {e}");
+            false
+        }
     }
 }
 
