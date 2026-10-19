@@ -789,7 +789,13 @@ pub async fn delete_workflow_for_owner(
 
 // -- Workflow Run CRUD --------------------------------------------------------
 
-/// Insert a new workflow run. Returns the new run's UUID.
+/// Insert a new `pending` workflow run, or return the run that already exists
+/// for the same `(workflow_id, trigger_event_id)`.
+///
+/// A triggering event has at most one run per workflow, so repeating the
+/// dispatch of an event cannot start a workflow twice. The returned run may
+/// already be running or finished; [`claim_workflow_run`] decides whether the
+/// caller may execute it. Runs without a trigger event are always new.
 ///
 /// `trigger_context` is the serialized `TriggerContext` for this run. It is stored
 /// so that post-approval resume steps can restore the original trigger data and
@@ -803,11 +809,14 @@ pub async fn create_workflow_run(
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"
         INSERT INTO workflow_runs
             (community_id, id, workflow_id, status, trigger_event_id, current_step, execution_trace, trigger_context)
         VALUES ($1, $2, $3, 'pending', $4, 0, '[]', $5)
+        ON CONFLICT (community_id, trigger_event_id, workflow_id)
+            WHERE trigger_event_id IS NOT NULL
+            DO NOTHING
         "#,
     )
     .bind(community_id.as_uuid())
@@ -817,8 +826,66 @@ pub async fn create_workflow_run(
     .bind(trigger_context)
     .execute(pool)
     .await?;
+    if inserted.rows_affected() > 0 {
+        return Ok(id);
+    }
 
-    Ok(id)
+    let existing = sqlx::query(
+        "SELECT id FROM workflow_runs \
+         WHERE community_id = $1 AND trigger_event_id = $2 AND workflow_id = $3",
+    )
+    .bind(community_id.as_uuid())
+    .bind(trigger_event_id)
+    .bind(workflow_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(existing.try_get("id")?)
+}
+
+/// Move a `pending` run to `running`. Returns `false` when the run is not
+/// pending: another executor already started it, or it finished or was
+/// cancelled. Every event-triggered execution claims through this one
+/// statement, so a run's actions start at most once.
+pub async fn claim_workflow_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+) -> Result<bool> {
+    let claimed = sqlx::query(
+        "UPDATE workflow_runs SET status = 'running', started_at = NOW() \
+         WHERE community_id = $1 AND id = $2 AND status = 'pending'",
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(claimed.rows_affected() > 0)
+}
+
+/// Cancel the never-started runs of `trigger_event_id` whose workflow is not in
+/// `selected_workflows`. Used when a recovered event is matched again: a run
+/// reserved before a crash, for a workflow that no longer fires, stays visible
+/// as cancelled instead of pending forever. This line has no `error_code`
+/// column, so the reason leads `error_message`.
+pub async fn cancel_unselected_pending_runs(
+    pool: &PgPool,
+    community_id: CommunityId,
+    trigger_event_id: &[u8],
+    selected_workflows: &[Uuid],
+) -> Result<u64> {
+    Ok(sqlx::query(
+        "UPDATE workflow_runs \
+         SET status = 'cancelled', completed_at = NOW(), \
+             error_message = 'not_selected_on_recovery: workflow no longer matched when the event was dispatched again' \
+         WHERE community_id = $1 AND trigger_event_id = $2 AND status = 'pending' \
+           AND NOT (workflow_id = ANY($3))",
+    )
+    .bind(community_id.as_uuid())
+    .bind(trigger_event_id)
+    .bind(selected_workflows)
+    .execute(pool)
+    .await?
+    .rows_affected())
 }
 
 /// Fetch a single workflow run by ID, scoped to its community.
@@ -1791,6 +1858,103 @@ mod tests {
         .await
         .expect("create workflow");
         (workflow_id, community)
+    }
+
+    /// A trigger event has one run per workflow, a run is claimed for
+    /// execution once, and recovery cancels only never-started runs of
+    /// workflows it did not select.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn event_triggered_runs_are_created_and_claimed_once() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let (selected, _) = make_workflow_in(&pool, community).await;
+        let (unselected, _) = make_workflow_in(&pool, community).await;
+        let trigger = Uuid::new_v4().as_bytes().repeat(2);
+
+        let run = create_workflow_run(&pool, community, selected, Some(&trigger), None)
+            .await
+            .expect("create run");
+        let again = create_workflow_run(&pool, community, selected, Some(&trigger), None)
+            .await
+            .expect("create run again");
+        assert_eq!(run, again, "one run per (workflow, trigger event)");
+        let untriggered = [
+            create_workflow_run(&pool, community, selected, None, None)
+                .await
+                .expect("untriggered run"),
+            create_workflow_run(&pool, community, selected, None, None)
+                .await
+                .expect("untriggered run"),
+        ];
+        assert_ne!(
+            untriggered[0], untriggered[1],
+            "runs without a trigger are always new"
+        );
+
+        assert!(claim_workflow_run(&pool, community, run)
+            .await
+            .expect("claim"));
+        assert!(
+            !claim_workflow_run(&pool, community, run)
+                .await
+                .expect("claim again"),
+            "a run is claimed once"
+        );
+
+        // Concurrent dispatches of one event create and claim one run.
+        let racing_trigger = Uuid::new_v4().as_bytes().repeat(2);
+        let racers = (0..8).map(|_| {
+            let pool = pool.clone();
+            let trigger = racing_trigger.clone();
+            tokio::spawn(async move {
+                let id = create_workflow_run(&pool, community, selected, Some(&trigger), None)
+                    .await
+                    .expect("racing create");
+                (
+                    id,
+                    claim_workflow_run(&pool, community, id)
+                        .await
+                        .expect("racing claim"),
+                )
+            })
+        });
+        let mut ids = std::collections::HashSet::new();
+        let mut claims = 0;
+        for racer in racers {
+            let (id, claimed) = racer.await.expect("racer");
+            ids.insert(id);
+            claims += usize::from(claimed);
+        }
+        assert_eq!((ids.len(), claims), (1, 1));
+
+        // Recovery cancels the reserved run of the workflow it did not select
+        // and leaves the started one alone.
+        let reserved = create_workflow_run(&pool, community, unselected, Some(&trigger), None)
+            .await
+            .expect("reserved run");
+        let cancelled = cancel_unselected_pending_runs(&pool, community, &trigger, &[selected])
+            .await
+            .expect("cancel");
+        assert_eq!(cancelled, 1);
+        let reserved = get_workflow_run(&pool, community, reserved)
+            .await
+            .expect("reserved");
+        assert_eq!(reserved.status, RunStatus::Cancelled);
+        assert!(reserved
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("not_selected_on_recovery")));
+        let started = get_workflow_run(&pool, community, run)
+            .await
+            .expect("started");
+        assert_eq!(started.status, RunStatus::Running);
+        assert!(
+            !claim_workflow_run(&pool, community, reserved.id)
+                .await
+                .expect("claim cancelled"),
+            "a cancelled run never starts"
+        );
     }
 
     /// Confinement: a duplicate workflow UUID existing in both community A and
