@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: read
+      contents: write # GitHub requires write access to read a draft release asset.
       packages: write
     env:
       IMAGE: ghcr.io/a-arad/buzz:axes-relay-v0.2.1-weekend-dispatch-d84fac11
