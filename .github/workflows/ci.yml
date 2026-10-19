@@ -46,6 +46,7 @@ jobs:
               - 'deny.toml'
               - '.github/workflows/ci.yml'
               - 'scripts/run-tests.sh'
+              - 'docker-compose.yml'
               - 'justfile'
             desktop:
               - 'scripts/check-file-sizes-core.mjs'
