@@ -48,7 +48,7 @@ permissions: {}
 env:
   # Single source of truth for the image name; override with the
   # GHCR_SPRIG_IMAGE repo variable (same pattern as docker.yml).
-  IMAGE_NAME: ${{ vars.GHCR_SPRIG_IMAGE != '' && vars.GHCR_SPRIG_IMAGE || 'ghcr.io/block/buzz-sprig' }}
+  IMAGE_NAME: ${{ vars.GHCR_SPRIG_IMAGE != '' && vars.GHCR_SPRIG_IMAGE || format('ghcr.io/{0}-sprig', github.repository) }}
 
 jobs:
   build:
