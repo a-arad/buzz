@@ -176,6 +176,7 @@ pub async fn insert_mentions(
 #[derive(Clone, Debug)]
 pub struct Db {
     pub(crate) pool: PgPool,
+    pub(crate) community_host_aliases: std::collections::BTreeMap<String, Uuid>,
     /// Maximum connections configured for this pool (from [`DbConfig::max_connections`]).
     pub(crate) max_connections: u32,
     /// Optional read-replica pool (from [`DbConfig::read_database_url`]).
@@ -505,6 +506,9 @@ impl UsageMetricsLeader {
 /// Configuration for the Postgres connection pool.
 #[derive(Debug, Clone)]
 pub struct DbConfig {
+    /// Explicit additional request hosts for existing community IDs.
+    /// Canonical host rows, including archived rows, take precedence.
+    pub community_host_aliases: std::collections::BTreeMap<String, Uuid>,
     /// Postgres connection URL (usually sourced from `DATABASE_URL`).
     pub database_url: String,
     /// Optional read-replica connection URL (usually sourced from
@@ -539,6 +543,7 @@ impl Default for DbConfig {
     /// At 20 main + 5 audit = 25/pod, four relay pods fit within the PG limit.
     fn default() -> Self {
         Self {
+            community_host_aliases: Default::default(),
             database_url: "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string(), // sadscan:disable np.postgres.1
             read_database_url: None,
             max_connections: 20,
@@ -664,6 +669,7 @@ impl Db {
         let replica_read_max_age = read_budget_from_ms(config.replica_read_max_age_ms);
         Ok(Self {
             pool,
+            community_host_aliases: config.community_host_aliases.clone(),
             max_connections: config.max_connections,
             read_pool,
             read_max_connections,
@@ -778,6 +784,7 @@ impl Db {
     /// Creates a `Db` from an existing `PgPool` (useful in tests).
     pub fn from_pool(pool: PgPool) -> Self {
         Self {
+            community_host_aliases: Default::default(),
             max_connections: pool.options().get_max_connections(),
             read_max_connections: pool.options().get_max_connections(),
             pool,
@@ -797,6 +804,7 @@ impl Db {
     /// [`Db::fence`]).
     pub fn from_pools(pool: PgPool, read_pool: PgPool) -> Self {
         Self {
+            community_host_aliases: Default::default(),
             max_connections: pool.options().get_max_connections(),
             read_max_connections: read_pool.options().get_max_connections(),
             pool,
@@ -1200,15 +1208,27 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<Option<CommunityRecord>> {
+        let alias = self
+            .community_host_aliases
+            .get(&buzz_core::tenant::normalize_host(normalized_host));
         let row = sqlx::query(
             r#"
             SELECT id, host
             FROM communities
-            WHERE lower(host) = lower($1)
-              AND archived_at IS NULL
+            WHERE archived_at IS NULL
+              AND (
+                lower(host) = lower($1)
+                OR (
+                    id = $2
+                    AND NOT EXISTS (
+                        SELECT 1 FROM communities WHERE lower(host) = lower($1)
+                    )
+                )
+              )
             "#,
         )
         .bind(normalized_host)
+        .bind(alias)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -6009,6 +6029,82 @@ mod tests {
             .expect("lookup stored-case host")
             .expect("community found by stored-case host");
         assert_eq!(found.id, CommunityId::from_uuid(id));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_host_aliases_preserve_identity_across_canonical_rename() {
+        let mut db = setup_db().await;
+        let id = Uuid::new_v4();
+        let old = format!("old-{}.example", id.simple());
+        let new = format!("new-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(&old)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.community_host_aliases.insert(new.clone(), id);
+        db.community_host_aliases.insert(old.clone(), id);
+        for host in [&old, &new] {
+            let found = db.lookup_community_by_host(host).await.unwrap().unwrap();
+            assert_eq!(found.id, CommunityId::from_uuid(id));
+            assert_eq!(found.host, old);
+        }
+        assert!(db
+            .lookup_community_by_host("unmapped.example")
+            .await
+            .unwrap()
+            .is_none());
+
+        sqlx::query("UPDATE communities SET host = $1 WHERE id = $2")
+            .bind(&new)
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for host in [&old, &new] {
+            let found = db.lookup_community_by_host(host).await.unwrap().unwrap();
+            assert_eq!(found.id, CommunityId::from_uuid(id));
+            assert_eq!(found.host, new);
+        }
+        sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.lookup_community_by_host(&old).await.unwrap().is_none());
+        assert!(db.lookup_community_by_host(&new).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_host_aliases_never_override_canonical_or_archived_hosts() {
+        let mut db = setup_db().await;
+        let id = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let host = format!("canonical-{}.example", id.simple());
+        let alias = format!("alias-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2), ($3, $4)")
+            .bind(id)
+            .bind(&host)
+            .bind(other)
+            .bind(format!("other-{}.example", other.simple()))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.community_host_aliases.insert(host.clone(), other);
+        db.community_host_aliases
+            .insert(alias.clone(), Uuid::new_v4());
+        let found = db.lookup_community_by_host(&host).await.unwrap().unwrap();
+        assert_eq!(found.id, CommunityId::from_uuid(id));
+        assert!(db.lookup_community_by_host(&alias).await.unwrap().is_none());
+        sqlx::query("UPDATE communities SET archived_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(db.lookup_community_by_host(&host).await.unwrap().is_none());
     }
 
     #[tokio::test]

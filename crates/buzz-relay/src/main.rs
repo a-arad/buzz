@@ -164,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let db_config = DbConfig {
+        community_host_aliases: config.community_host_aliases.clone(),
         database_url: config.database_url.clone(),
         read_database_url: config.read_database_url.clone(),
         replica_read_max_age_ms: config.replica_read_max_age_ms,

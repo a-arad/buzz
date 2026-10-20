@@ -24,6 +24,37 @@ pub enum ConfigError {
     InvalidValue(String),
 }
 
+fn parse_community_host_aliases(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<String, uuid::Uuid>, ConfigError> {
+    let invalid = || {
+        ConfigError::InvalidValue(
+            "BUZZ_COMMUNITY_HOST_ALIASES must map valid hosts to non-nil community UUIDs"
+                .to_string(),
+        )
+    };
+    let entries: std::collections::BTreeMap<String, uuid::Uuid> =
+        serde_json::from_str(raw).map_err(|_| invalid())?;
+    let mut aliases = std::collections::BTreeMap::new();
+    for (host, community) in entries {
+        let host = buzz_core::tenant::normalize_host(&host);
+        let url = url::Url::parse(&format!("wss://{host}")).map_err(|_| invalid())?;
+        if community.is_nil()
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || buzz_core::tenant::relay_url_authority(url.as_str()) != host
+            || aliases.insert(host, community).is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(aliases)
+}
+
 /// Deny-by-default read-only deployment-admin configuration.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
@@ -103,6 +134,8 @@ pub struct Config {
     pub db_read_pool_size: Option<u32>,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
+    /// Explicit additional request hosts mapped to existing community IDs.
+    pub community_host_aliases: std::collections::BTreeMap<String, uuid::Uuid>,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
     pub pairing_relay_url: Option<String>,
     /// Maximum number of concurrent WebSocket connections.
@@ -535,6 +568,9 @@ impl Config {
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
+        let community_host_aliases = parse_community_host_aliases(
+            &std::env::var("BUZZ_COMMUNITY_HOST_ALIASES").unwrap_or_else(|_| "{}".to_string()),
+        )?;
 
         let pairing_relay_url = std::env::var("BUZZ_PAIRING_RELAY_URL")
             .ok()
@@ -999,6 +1035,7 @@ impl Config {
             db_pool_size,
             db_read_pool_size,
             relay_url,
+            community_host_aliases,
             pairing_relay_url,
             max_connections,
             max_concurrent_handlers,
@@ -1051,6 +1088,41 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn community_host_aliases_normalize_hosts_and_preserve_community_ids() {
+        let id = uuid::Uuid::new_v4();
+        let raw = serde_json::json!({"BUZZ.EXAMPLE.:443": id, "legacy.example": id}).to_string();
+        let aliases = parse_community_host_aliases(&raw).unwrap();
+        assert_eq!(aliases.get("buzz.example"), Some(&id));
+        assert_eq!(aliases.get("legacy.example"), Some(&id));
+        assert!(parse_community_host_aliases("{}").unwrap().is_empty());
+    }
+
+    #[test]
+    fn community_host_aliases_reject_ambiguous_or_invalid_configuration() {
+        let id = uuid::Uuid::new_v4();
+        for host in [
+            "",
+            "wss://buzz.example",
+            "buzz.example/path",
+            "user@buzz.example",
+            "buzz.example?query",
+            "buzz.example#fragment",
+            "buzz example",
+        ] {
+            let raw = serde_json::json!({host: id}).to_string();
+            assert!(parse_community_host_aliases(&raw).is_err(), "{host}");
+        }
+        for raw in [
+            serde_json::json!({"buzz.example": uuid::Uuid::nil()}).to_string(),
+            serde_json::json!({"buzz.example": "not-a-uuid"}).to_string(),
+            serde_json::json!({"BUZZ.EXAMPLE": id, "buzz.example": id}).to_string(),
+            "[]".to_string(),
+        ] {
+            assert!(parse_community_host_aliases(&raw).is_err(), "{raw}");
+        }
+    }
 
     // Mutex to serialize tests that mutate environment variables.
     // Parallel env-var mutation causes `defaults_are_valid` to see the invalid
