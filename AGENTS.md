@@ -122,6 +122,8 @@ Additional rules:
 
 **Nostr-first HTTP surface**: Buzz's primary API is NIP-29 over WebSocket. The relay also exposes a narrow HTTP surface: NIP-11/NIP-05 metadata, `POST /events`, `POST /query`, `POST /count`, workflow webhooks at `/hooks/{id}`, Blossom media, git smart HTTP, git policy hooks, and health probes. These HTTP paths all preserve the same host-derived community boundary.
 
+For an existing workspace's hostname change, follow [community host migration](docs/community-host-migration.md). Preserve its community ID and signed-request host binding.
+
 **Prefer Nostr events over new HTTP endpoints**: For new feature work, model
 the operation as a Nostr event (new kind in `buzz-core/src/kind.rs`, handler
 in `buzz-relay`) rather than adding endpoint-specific JSON APIs. HTTP is
