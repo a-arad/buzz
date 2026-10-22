@@ -29,8 +29,10 @@ ARG NPM_REGISTRY=
 
 # ─── Stage 1: cargo-chef base ───────────────────────────────────────────────
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+# Repair the build container's trust before Cargo downloads any dependencies.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends 'ca-certificates>=20250419~deb12u2' \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && rm -rf /var/lib/apt/lists/*
 # Trust an optional corporate-proxy CA before any network fetch (no-op if unset).
 ARG EXTRA_CA_CERTS
@@ -136,10 +138,11 @@ LABEL org.opencontainers.image.title="Buzz" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        'ca-certificates>=20250419~deb12u2' \
+        ca-certificates \
         curl \
         git \
         openssl \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 buzz \
     && useradd  --system --uid 1000 --gid 1000 --home-dir /var/lib/buzz \
