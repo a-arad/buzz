@@ -12,7 +12,7 @@
 # itself is platform-agnostic; do not add --platform pins.
 
 ARG RUST_VERSION=1.95
-ARG NODE_VERSION=24
+ARG NODE_VERSION=24.22.1
 ARG DEBIAN_VERSION=bookworm
 
 # Optional extra CA bundle for builds behind a TLS-intercepting corporate proxy
@@ -29,6 +29,9 @@ ARG NPM_REGISTRY=
 
 # ─── Stage 1: cargo-chef base ───────────────────────────────────────────────
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends 'ca-certificates>=20250419~deb12u2' \
+    && rm -rf /var/lib/apt/lists/*
 # Trust an optional corporate-proxy CA before any network fetch (no-op if unset).
 ARG EXTRA_CA_CERTS
 COPY --chmod=0644 ${EXTRA_CA_CERTS:-Dockerfile} /tmp/extra-ca/src
@@ -133,7 +136,7 @@ LABEL org.opencontainers.image.title="Buzz" \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
+        'ca-certificates>=20250419~deb12u2' \
         curl \
         git \
         openssl \
