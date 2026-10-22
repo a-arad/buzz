@@ -7,3 +7,17 @@ spec:
   valuesContent: |-
     additionalArguments:
       - "--entryPoints.websecure.transport.respondingTimeouts.readTimeout=120s"
+    env:
+      - name: SSL_CERT_FILE
+        value: /etc/axes-security-trust/ca-bundle.pem
+      - name: SSL_CERT_DIR
+        value: /etc/axes-security-trust
+    deployment:
+      additionalVolumes:
+        - name: axes-security-trust
+          configMap:
+            name: axes-trust-traefik-20261022
+    additionalVolumeMounts:
+      - name: axes-security-trust
+        mountPath: /etc/axes-security-trust
+        readOnly: true

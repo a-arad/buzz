@@ -11,6 +11,19 @@ allows 120 seconds for HTTPS request headers and body, retaining a finite limit.
 It does not extend proof validity at admission, disable authentication, or change
 the relay's upload size limits.
 
+The October 2026 trust override also selects the immutable
+`axes-trust-traefik-20261022` ConfigMap in `kube-system`. Create it before
+installing this configuration: retain the running image's public CA bundle
+and remove the affected eMudhra/AAA roots by SHA-256 fingerprint. The operator
+receipt on `buzz-trial` is under
+`/var/lib/axes-security-remediation/2026-10-22/kubernetes-trust/`.
+The override applies to outbound certificate validation; inbound certificates
+and ACME account state keep their existing locations. Verify that both
+`dv-g3b-emudhra.we-have-a-problem.com` and
+`dv-g3b-aaa-emudhra.we-have-a-problem.com` fail certificate verification and a
+valid control succeeds. Remove the override only after verifying a repaired
+image's default trust store.
+
 Validate the exact installed Traefik version with an isolated slow-body transfer.
 After protected-main acceptance, back up the current HelmChart, any
 HelmChartConfig, and Traefik Deployment. Use the k3s-supported HelmChartConfig
