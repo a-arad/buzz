@@ -12,7 +12,7 @@
 # itself is platform-agnostic; do not add --platform pins.
 
 ARG RUST_VERSION=1.95
-ARG NODE_VERSION=24
+ARG NODE_VERSION=24.22.1
 ARG DEBIAN_VERSION=bookworm
 
 # Optional extra CA bundle for builds behind a TLS-intercepting corporate proxy
@@ -145,6 +145,7 @@ RUN apt-get update \
         curl \
         git \
         openssl \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 buzz \
     && useradd  --system --uid 1000 --gid 1000 --home-dir /var/lib/buzz \
