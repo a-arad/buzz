@@ -961,6 +961,7 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    pub(crate) routing: Option<crate::routing::RoutingLog>,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -3207,6 +3208,18 @@ pub async fn run_prompt_task(
         turn_id.clone(),
         turn_started_at,
     ));
+    if let (Some(log), Some(batch)) = (&ctx.routing, &batch) {
+        for event in &batch.events {
+            log.record(
+                &event.event,
+                batch.channel_id,
+                "dispatch_prepared",
+                serde_json::json!({
+                    "harness_turn_id": turn_id, "acp_session_id": session_id,
+                }),
+            );
+        }
+    }
     // Backfill liveness's shared session ID so ticks after this point carry
     // it too, matching every other observer frame for this turn.
     liveness_guard.set_session_id(session_id.clone());
@@ -3681,6 +3694,18 @@ pub async fn run_prompt_task(
             None,
         );
         return;
+    }
+    if let (Some(log), Some(batch)) = (&ctx.routing, &batch) {
+        for event in &batch.events {
+            log.record(
+                &event.event,
+                batch.channel_id,
+                "dispatch_attempted",
+                serde_json::json!({
+                    "harness_turn_id": turn_id, "acp_session_id": session_id,
+                }),
+            );
+        }
     }
     let prompt_result = match control_rx {
         None => {
@@ -8104,6 +8129,15 @@ done"#
 
         let mut ctx = make_prompt_context_no_owner();
         ctx.base_prompt = Some("standing-once".into());
+        let receipts = tempfile::tempdir().expect("routing directory");
+        ctx.routing = Some(
+            crate::routing::RoutingLog::open(
+                receipts.path().to_path_buf(),
+                "recipient".into(),
+                serde_json::json!({}),
+            )
+            .expect("routing log"),
+        );
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
 
@@ -8142,6 +8176,18 @@ done"#
                     result.outcome,
                     PromptOutcome::Ok(StopReason::EndTurn)
                 )),
+            }
+            let rows = crate::routing::retained_rows(receipts.path());
+            let routed: Vec<_> = rows
+                .iter()
+                .filter(|row| row["event_id"] == event_id)
+                .collect();
+            assert_eq!(routed.len(), 2);
+            assert_eq!(routed[0]["outcome"], "dispatch_prepared");
+            assert_eq!(routed[1]["outcome"], "dispatch_attempted");
+            for row in routed {
+                assert_eq!(row["detail"]["harness_turn_id"], format!("turn-{turn}"));
+                assert_eq!(row["detail"]["acp_session_id"], "live-session");
             }
             let delivery = &result.agent.state.deliveries[&conv(channel_id)];
             assert_eq!(
@@ -11207,6 +11253,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            routing: None,
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),

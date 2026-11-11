@@ -248,6 +248,29 @@ buzz-acp --respond-to anyone
 buzz-acp --respond-to nobody --heartbeat-interval 300
 ```
 
+### Private routing receipts
+
+Set `--routing-log-dir /private/path` or `BUZZ_ACP_ROUTING_LOG_DIR` to retain
+append-only JSONL receipts from the normal inbound message router. The option is
+disabled by default. Each controller instance records a policy snapshot and its
+SHA-256, then records the message ID, recipient, channel, timestamp and decision:
+author allowed/rejected, unmatched subscription, queued, dropped (including the
+actual evicted message ID), dispatch prepared, and dispatch attempted. Dispatch
+records include the harness turn ID and ACP session ID.
+
+These receipts distinguish controller decisions from agent interpretation.
+`dispatch_attempted` records entry into the prompt call; it does not prove that
+the model read, understood, or acted on the message. Receipts do not cover events
+never received by this controller, owner control commands, or every alternate
+routing path. An absent receipt is not proof of non-delivery. They cannot explain
+historical events that predate enablement.
+
+Message bodies and credentials are not copied. Files are created with mode 0600
+on Unix, appended and synced after each record, with a new file per UTC day and
+controller instance. The operator owns retention and access to the directory.
+Failure to open the configured log prevents startup; a later write failure is
+logged with the message ID and outcome while message routing continues.
+
 ### Host-controlled launch wrapper
 
 On Unix, a trusted host can set `BUZZ_ACP_LAUNCH_PREFIX` to a JSON argument array, for
