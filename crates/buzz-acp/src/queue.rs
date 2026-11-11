@@ -120,6 +120,18 @@ pub struct QueuedEvent {
 }
 
 impl QueuedEvent {
+    fn record_routing(
+        &self,
+        log: &Option<crate::routing::RoutingLog>,
+        outcome: &str,
+        reason: &str,
+    ) {
+        if let Some(log) = log {
+            log.record(&self.event, self.channel_id, outcome, serde_json::json!({
+                "reason": reason, "scope": self.scope.telemetry_label(), "rule": self.prompt_tag,
+            }));
+        }
+    }
     fn into_batch_event(self) -> BatchEvent {
         BatchEvent {
             event: self.event,
@@ -331,6 +343,7 @@ pub struct FlushBatch {
 ///     else: push_front with original received_at, set exponential backoff retry_after with jitter
 /// ```
 pub struct EventQueue {
+    pub(crate) routing: Option<crate::routing::RoutingLog>,
     queues: HashMap<SessionScope, VecDeque<QueuedEvent>>,
     in_flight_scopes: HashSet<SessionScope>,
     /// Per-scope deadline for auto-expiring stuck in-flight entries.
@@ -377,6 +390,7 @@ impl EventQueue {
     /// derive the deadline from the configured `max_turn_duration`.
     pub fn new(dedup_mode: DedupMode) -> Self {
         Self {
+            routing: None,
             queues: HashMap::new(),
             in_flight_scopes: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
@@ -450,6 +464,7 @@ impl EventQueue {
                 scope = %event.scope.telemetry_label(),
                 "dropping event for in-flight scope (drop mode)"
             );
+            event.record_routing(&self.routing, "dropped", "in_flight_drop_mode");
             return false;
         }
         let channel_id = event.channel_id;
@@ -457,7 +472,9 @@ impl EventQueue {
         let queue = self.queues.entry(scope.clone()).or_default();
         // Enforce per-scope depth cap: drop oldest in this partition.
         if queue.len() >= MAX_PENDING_PER_SCOPE {
-            queue.pop_front();
+            if let Some(dropped) = queue.pop_front() {
+                dropped.record_routing(&self.routing, "dropped", "scope_capacity");
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -466,6 +483,9 @@ impl EventQueue {
             );
         }
         queue.push_back(event);
+        if let Some(queued) = queue.back() {
+            queued.record_routing(&self.routing, "queued", "subscription_match");
+        }
         // Enforce the aggregate per-channel cap across all scopes so thread
         // partitioning cannot multiply the admitted backlog.
         self.enforce_channel_cap(channel_id);
@@ -495,7 +515,9 @@ impl EventQueue {
                 .map(|(s, _)| s.clone());
             let Some(scope) = victim else { break };
             if let Some(q) = self.queues.get_mut(&scope) {
-                q.pop_front();
+                if let Some(dropped) = q.pop_front() {
+                    dropped.record_routing(&self.routing, "dropped", "channel_capacity");
+                }
                 if q.is_empty() {
                     self.queues.remove(&scope);
                 }
@@ -719,6 +741,18 @@ impl EventQueue {
         };
 
         if attempt > MAX_RETRIES {
+            if let Some(log) = &self.routing {
+                for event in &batch.events {
+                    log.record(
+                        &event.event,
+                        channel_id,
+                        "dropped",
+                        serde_json::json!({
+                            "reason": "retry_exhausted", "attempt": attempt,
+                        }),
+                    );
+                }
+            }
             tracing::error!(
                 channel_id = %channel_id,
                 attempt,
@@ -772,7 +806,9 @@ impl EventQueue {
         // the partition over the limit. Without this, repeated requeue+push
         // cycles can grow the queue unboundedly.
         while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
+            if let Some(dropped) = queue.pop_back() {
+                dropped.record_routing(&self.routing, "dropped", "scope_capacity_on_restore");
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -835,7 +871,9 @@ impl EventQueue {
         }
         // Enforce per-scope cap: trim newest (back) events if over limit.
         while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
+            if let Some(dropped) = queue.pop_back() {
+                dropped.record_routing(&self.routing, "dropped", "scope_capacity_on_restore");
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -1201,7 +1239,9 @@ impl EventQueue {
         let queue = self.queues.entry(scope.clone()).or_default();
         queue.push_front(qe);
         while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
+            if let Some(dropped) = queue.pop_back() {
+                dropped.record_routing(&self.routing, "dropped", "scope_capacity_on_restore");
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -1258,7 +1298,9 @@ impl EventQueue {
             queue.push_front(qe);
         }
         while queue.len() > MAX_PENDING_PER_SCOPE {
-            queue.pop_back();
+            if let Some(dropped) = queue.pop_back() {
+                dropped.record_routing(&self.routing, "dropped", "scope_capacity_on_restore");
+            }
             tracing::warn!(
                 channel_id = %channel_id,
                 scope = %scope.telemetry_label(),
@@ -3940,6 +3982,15 @@ mod tests {
     #[test]
     fn test_drop_mode_discards_in_flight_events() {
         let mut q = EventQueue::new(DedupMode::Drop);
+        let directory = tempfile::tempdir().unwrap();
+        q.routing = Some(
+            crate::routing::RoutingLog::open(
+                directory.path().to_path_buf(),
+                "recipient".into(),
+                serde_json::json!({"dedup_mode": "drop"}),
+            )
+            .unwrap(),
+        );
         let ch = Uuid::new_v4();
 
         q.push(make_queued(ch, "first"));
@@ -3947,12 +3998,45 @@ mod tests {
         assert!(any_in_flight(&q));
 
         // In drop mode, pushing to the in-flight channel should be discarded.
-        q.push(make_queued(ch, "dropped"));
+        let dropped = make_queued(ch, "dropped");
+        let dropped_id = dropped.event.id.to_hex();
+        q.push(dropped);
         assert_eq!(pending_count(&q), 0, "event should be dropped");
 
         q.mark_complete(ch);
         // Nothing to flush.
         assert!(q.flush_next().is_none());
+        let rows = crate::routing::retained_rows(directory.path());
+        assert!(rows.iter().any(|row| row["event_id"] == dropped_id
+            && row["outcome"] == "dropped"
+            && row["detail"]["reason"] == "in_flight_drop_mode"));
+    }
+
+    #[test]
+    fn routing_receipt_identifies_the_evicted_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut q = EventQueue::new(DedupMode::Queue);
+        q.routing = Some(
+            crate::routing::RoutingLog::open(
+                directory.path().to_path_buf(),
+                "recipient".into(),
+                serde_json::json!({"dedup_mode": "queue"}),
+            )
+            .unwrap(),
+        );
+        let channel = Uuid::new_v4();
+        let first = make_queued(channel, "oldest");
+        let first_id = first.event.id.to_hex();
+        q.push(first);
+        for index in 0..MAX_PENDING_PER_SCOPE {
+            q.push(make_queued(channel, &format!("later {index}")));
+        }
+        let rows = crate::routing::retained_rows(directory.path());
+        let discarded: Vec<_> = rows.iter().filter(|r| r["outcome"] == "dropped").collect();
+        assert_eq!(discarded.len(), 1);
+        assert_eq!(discarded[0]["event_id"], first_id);
+        assert_eq!(discarded[0]["detail"]["reason"], "scope_capacity");
+        assert_eq!(pending_count(&q), MAX_PENDING_PER_SCOPE);
     }
 
     #[test]

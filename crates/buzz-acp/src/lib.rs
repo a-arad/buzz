@@ -22,6 +22,7 @@ mod prompt_project;
 mod queue;
 mod recovery_wake;
 mod relay;
+mod routing;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
@@ -563,9 +564,13 @@ mod inbound_author_gate {
     pub(crate) struct AuthorizedListenerEvent {
         buzz_event: relay::BuzzEvent,
         effective_author: String,
+        routing: Option<crate::routing::RoutingLog>,
     }
 
     impl AuthorizedListenerEvent {
+        pub(crate) fn routing(&self) -> Option<crate::routing::RoutingLog> {
+            self.routing.clone()
+        }
         pub(crate) fn into_parts(self) -> (relay::BuzzEvent, String) {
             (self.buzz_event, self.effective_author)
         }
@@ -623,6 +628,7 @@ mod inbound_author_gate {
     pub(crate) struct InboundAuthorGate {
         agent_pubkey_hex: String,
         relay_self: Option<String>,
+        routing: Option<crate::routing::RoutingLog>,
         // None means no authoritative NIP-11 result yet, including at startup.
         refreshed_generation: Option<u64>,
     }
@@ -642,8 +648,13 @@ mod inbound_author_gate {
             Self {
                 agent_pubkey_hex: agent_pubkey_hex.to_string(),
                 relay_self,
+                routing: None,
                 refreshed_generation: completed.then_some(0),
             }
+        }
+
+        pub(crate) fn set_routing(&mut self, routing: Option<crate::routing::RoutingLog>) {
+            self.routing = routing;
         }
 
         /// Whether delegated workflow attribution is currently available.
@@ -746,11 +757,25 @@ mod inbound_author_gate {
                     rest_client,
                 )
                 .await;
+            if let Some(log) = &self.routing {
+                log.record(
+                    &buzz_event.event,
+                    buzz_event.channel_id,
+                    if decision.allowed {
+                        "author_allowed"
+                    } else {
+                        "author_rejected"
+                    },
+                    serde_json::json!({"effective_author": decision.effective_author,
+                        "mode": respond_to.to_string(), "is_dm": decision.is_dm}),
+                );
+            }
             if !decision.allowed {
                 // INFO, not debug: under owner-only fleets a dropped event is
                 // the whole story of "the agent never answered", and the
                 // default log filter hides debug.
                 tracing::info!(
+                    event_id = %buzz_event.event.id,
                     channel_id = %buzz_event.channel_id,
                     raw_author = %buzz_event.event.pubkey.to_hex(),
                     effective_author = %decision.effective_author,
@@ -763,6 +788,7 @@ mod inbound_author_gate {
             Some(AuthorizedListenerEvent {
                 buzz_event,
                 effective_author: decision.effective_author,
+                routing: self.routing.clone(),
             })
         }
 
@@ -808,6 +834,7 @@ impl AuthorizedNormalListenerEvent {
         rules: &[SubscriptionRule],
         agent_pubkey_hex: &str,
     ) -> Option<NormalListenerIngress> {
+        let routing = self.0.routing();
         let (buzz_event, effective_author) = self.0.into_parts();
         let matched = filter::match_event(
             &buzz_event.event,
@@ -815,7 +842,18 @@ impl AuthorizedNormalListenerEvent {
             rules,
             agent_pubkey_hex,
         )
-        .await?;
+        .await;
+        let Some(matched) = matched else {
+            if let Some(log) = routing {
+                log.record(
+                    &buzz_event.event,
+                    buzz_event.channel_id,
+                    "unmatched",
+                    serde_json::json!({"reason": "no_subscription_rule"}),
+                );
+            }
+            return None;
+        };
         Some(NormalListenerIngress {
             buzz_event,
             effective_author,
@@ -3014,6 +3052,29 @@ async fn run_harness(
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
     let rules = startup_subscription_rules(config)?;
+    let mut allowlist: Vec<_> = config.respond_to_allowlist.iter().cloned().collect();
+    allowlist.sort();
+    let routing_log = config
+        .routing_log_dir
+        .as_ref()
+        .map(|directory| {
+            routing::RoutingLog::open(
+                directory.clone(),
+                pubkey_hex.clone(),
+                serde_json::json!({
+                    "respond_to": config.respond_to.to_string(), "allowlist": allowlist,
+                    "subscribe_mode": format!("{:?}", config.subscribe_mode),
+                    "session_policy": format!("{:?}", config.session_policy),
+                    "dedup_mode": format!("{:?}", config.dedup_mode),
+                    "rules": rules.iter().map(|r| serde_json::json!({
+                        "name": r.name, "channels": format!("{:?}", r.channels), "kinds": r.kinds,
+                        "require_mention": r.require_mention, "filter": r.filter,
+                    })).collect::<Vec<_>>()
+                }),
+            )
+        })
+        .transpose()?;
+    author_gate_ctx.set_routing(routing_log.clone());
 
     let channel_filters = config::resolve_channel_filters(config, &channel_ids, &rules);
     if channel_filters.is_empty() {
@@ -3046,6 +3107,7 @@ async fn run_harness(
     let dedup_mode = config.dedup_mode;
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
+    queue.routing = routing_log.clone();
     let deployment_drain = deployment_drain::Drain::from_env();
     let drain_identity = format!("{}:{}", config.relay_url, pubkey_hex);
     deployment_drain.restore(&drain_identity, &mut queue)?;
@@ -3073,11 +3135,13 @@ async fn run_harness(
         );
     }
 
-    let ctx = Arc::new(runtime.prompt_context(
+    let mut prompt_context = runtime.prompt_context(
         relay.rest_client(),
         channel_info_map,
         SessionMode::Conversation,
-    )?);
+    )?;
+    prompt_context.routing = routing_log;
+    let ctx = Arc::new(prompt_context);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -7589,6 +7653,73 @@ mod author_gate_tests {
         (gate, rest_client, server)
     }
 
+    #[tokio::test]
+    async fn routing_receipts_distinguish_author_rejection_from_unmatched_subscription() {
+        let relay = nostr::Keys::generate();
+        let sender = nostr::Keys::generate();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let (mut gate, rest, server) = connected_gate(&relay.public_key().to_hex(), &agent).await;
+        let directory = tempfile::tempdir().unwrap();
+        gate.set_routing(Some(
+            crate::routing::RoutingLog::open(
+                directory.path().to_path_buf(),
+                agent.clone(),
+                serde_json::json!({"fixture": true}),
+            )
+            .unwrap(),
+        ));
+        let channel = Uuid::new_v4();
+        let channels = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel,
+                relay::ChannelInfo {
+                    name: "test".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest.clone(),
+        );
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "private request")
+            .sign_with_keys(&sender)
+            .unwrap();
+        let event_id = event.id.to_hex();
+        let owner = OwnerCache::new(None);
+        for mode in [RespondTo::Nobody, RespondTo::Anyone] {
+            let authorized = authorize_normal_listener_event(
+                &mut gate,
+                relay::BuzzEvent {
+                    event: event.clone(),
+                    channel_id: channel,
+                    connection_generation: 0,
+                },
+                &mode,
+                &HashSet::new(),
+                &owner,
+                &channels,
+                &rest,
+            )
+            .await;
+            if matches!(mode, RespondTo::Nobody) {
+                assert!(authorized.is_none());
+            } else {
+                assert!(AuthorizedNormalListenerEvent(authorized.unwrap())
+                    .match_subscription(&[], &agent)
+                    .await
+                    .is_none());
+            }
+        }
+        server.abort();
+        let rows = crate::routing::retained_rows(directory.path());
+        let outcomes: Vec<_> = rows
+            .iter()
+            .filter(|r| r["event_id"] == event_id)
+            .map(|r| r["outcome"].as_str().unwrap())
+            .collect();
+        assert_eq!(outcomes, ["author_rejected", "author_allowed", "unmatched"]);
+        assert!(rows.iter().all(|r| r["recipient_pubkey"] == agent));
+    }
+
     /// A genuine relay-signed workflow dispatch that explicitly targets `agent`
     /// on behalf of `owner` — the exact event shape a scheduled workflow emits.
     pub(super) fn relay_signed_workflow_dispatch(
@@ -10281,6 +10412,7 @@ mod build_mcp_servers_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            routing_log_dir: None,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
@@ -11378,6 +11510,7 @@ mod error_outcome_emission_tests {
             persona_env_vars: vec![],
             has_generated_codex_config: false,
             relay_observer: false,
+            routing_log_dir: None,
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
