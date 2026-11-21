@@ -169,6 +169,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. `0` disables this deadline. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn. `0` disables this deadline. |
+| `BUZZ_ACP_INITIALIZE_TIMEOUT` | no | `60` | Seconds an adapter may take to answer `initialize`, at startup and on every respawn. Must be 1–3600; other non-prompt RPCs keep their fixed 60-second limit. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.

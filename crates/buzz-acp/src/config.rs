@@ -39,6 +39,14 @@ pub(crate) const DEFAULT_MAX_TURN_DURATION_SECS: u64 = 7200;
 /// deadline (`max_turn_duration + IN_FLIGHT_DEADLINE_BUFFER_SECS`).
 pub(crate) const MAX_TURN_DURATION_CEILING_SECS: u64 = 604_800;
 
+/// Default deadline for the ACP `initialize` handshake.
+/// Override via `--initialize-timeout` / `BUZZ_ACP_INITIALIZE_TIMEOUT`.
+pub(crate) const DEFAULT_INITIALIZE_TIMEOUT_SECS: u64 = 60;
+
+/// Upper bound for `initialize_timeout` (1 hour). The handshake must stay
+/// finite so a wedged adapter is still reaped and its slot released.
+pub(crate) const INITIALIZE_TIMEOUT_CEILING_SECS: u64 = 3_600;
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to parse nostr keys: {0}")]
@@ -280,6 +288,12 @@ pub struct CliArgs {
     /// Absolute wall-clock cap per turn. Zero disables the cap.
     #[arg(long, env = "BUZZ_ACP_MAX_TURN_DURATION", default_value_t = DEFAULT_MAX_TURN_DURATION_SECS)]
     pub max_turn_duration: u64,
+
+    /// Seconds an adapter may take to answer `initialize`, at startup and on
+    /// every respawn. Other non-prompt RPCs keep their fixed 60-second limit.
+    #[arg(long, env = "BUZZ_ACP_INITIALIZE_TIMEOUT", default_value_t = DEFAULT_INITIALIZE_TIMEOUT_SECS,
+          value_parser = clap::value_parser!(u64).range(1..=INITIALIZE_TIMEOUT_CEILING_SECS))]
+    pub initialize_timeout: u64,
 
     /// Deprecated: alias for --idle-timeout. If both set, --idle-timeout wins.
     #[arg(long, env = "BUZZ_ACP_TURN_TIMEOUT", hide = true)]
@@ -550,6 +564,7 @@ pub struct Config {
     pub mcp_command: String,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
+    pub initialize_timeout_secs: u64,
     pub agents: u32,
     pub heartbeat_interval_secs: u64,
     /// Seconds between per-turn liveness pings. 0 = disabled. Distinct from
@@ -1152,6 +1167,7 @@ impl Config {
             mcp_command: args.mcp_command,
             idle_timeout_secs,
             max_turn_duration_secs,
+            initialize_timeout_secs: args.initialize_timeout,
             agents: args.agents,
             heartbeat_interval_secs: heartbeat_interval,
             turn_liveness_secs,
@@ -1219,7 +1235,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s initialize_timeout={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1227,6 +1243,7 @@ impl Config {
             self.mcp_command,
             self.idle_timeout_secs,
             self.max_turn_duration_secs,
+            self.initialize_timeout_secs,
             self.agents,
             self.heartbeat_interval_secs,
             self.subscribe_mode,
@@ -1538,6 +1555,7 @@ mod tests {
             mcp_command: "".into(),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
+            initialize_timeout_secs: DEFAULT_INITIALIZE_TIMEOUT_SECS,
             agents: 1,
             heartbeat_interval_secs: 0,
             turn_liveness_secs: 10,
@@ -3101,6 +3119,41 @@ channels = "ALL"
         // Verify that even at the ceiling, this addition cannot overflow u64.
         const {
             assert!(MAX_TURN_DURATION_CEILING_SECS < u64::MAX - 100);
+        }
+    }
+
+    // --- initialize_timeout ---
+
+    #[test]
+    fn initialize_timeout_defaults_to_sixty_seconds_and_accepts_override() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["buzz-acp", "--private-key", TEST_PRIVATE_KEY];
+            argv.extend_from_slice(extra);
+            Config::from_args(CliArgs::try_parse_from(argv).unwrap()).unwrap()
+        };
+        assert_eq!(parse(&[]).initialize_timeout_secs, 60);
+        let ceiling = INITIALIZE_TIMEOUT_CEILING_SECS.to_string();
+        assert_eq!(
+            parse(&["--initialize-timeout", &ceiling]).initialize_timeout_secs,
+            INITIALIZE_TIMEOUT_CEILING_SECS
+        );
+        assert!(parse(&["--initialize-timeout", "180"])
+            .summary()
+            .contains("initialize_timeout=180s"));
+    }
+
+    #[test]
+    fn initialize_timeout_rejects_zero_unbounded_and_malformed_values() {
+        let over = (INITIALIZE_TIMEOUT_CEILING_SECS + 1).to_string();
+        for value in ["0", over.as_str(), "-1", "60s", ""] {
+            let parsed = CliArgs::try_parse_from([
+                "buzz-acp",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--initialize-timeout",
+                value,
+            ]);
+            assert!(parsed.is_err(), "{value:?} must be rejected");
         }
     }
 

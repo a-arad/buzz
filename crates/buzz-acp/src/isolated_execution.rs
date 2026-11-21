@@ -36,7 +36,7 @@ pub(crate) async fn execute(
         biased;
         _ = &mut cancel => Err(Outcome::Cancelled),
         _ = tokio::time::sleep_until(deadline) => Err(Outcome::Deadline),
-        result = acp.initialize() => result.map_err(|_| Outcome::Failed("agent_initialize_failed")),
+        result = acp.initialize_with_timeout(startup.initialize_timeout) => result.map_err(|_| Outcome::Failed("agent_initialize_failed")),
     };
     let init = match initialized {
         Ok(init) => init,
