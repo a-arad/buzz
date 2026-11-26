@@ -37,8 +37,14 @@ impl Reminders {
                     .map(|p| PathBuf::from(p).join(".local/state/buzz-acp/reminders"))
             })
             .context("no state directory for reminder delivery receipts")?;
+        let delivered = std::env::var_os("BUZZ_ACP_REMINDER_DELIVERED_DIR").map(PathBuf::from);
         Ok(Self {
-            receipts: Receipts::open(&base, &client.base_url, &client.keys.public_key().to_hex())?,
+            receipts: Receipts::open(
+                &base,
+                delivered.as_deref(),
+                &client.base_url,
+                &client.keys.public_key().to_hex(),
+            )?,
             pending: Vec::new(),
             in_flight: None,
             retries: Default::default(),
