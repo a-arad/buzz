@@ -25,8 +25,13 @@ fn event(keys: &Keys, id: &str, due: u64, created: u64) -> Event {
 
 fn state(directory: &std::path::Path, keys: &Keys) -> Reminders {
     Reminders {
-        receipts: Receipts::open(directory, "https://relay.test", &keys.public_key().to_hex())
-            .unwrap(),
+        receipts: Receipts::open(
+            directory,
+            None,
+            "https://relay.test",
+            &keys.public_key().to_hex(),
+        )
+        .unwrap(),
         pending: vec![],
         in_flight: None,
         retries: HashMap::new(),
@@ -111,12 +116,12 @@ fn future_snoozed_and_cancelled_heads_supersede_queued_intent() {
 #[test]
 fn receipt_lock_and_scope_prevent_local_competing_consumers() {
     let directory = tempfile::tempdir().unwrap();
-    let first = Receipts::open(directory.path(), "https://one.test", "author").unwrap();
-    assert!(Receipts::open(directory.path(), "https://one.test", "author").is_err());
-    assert!(Receipts::open(directory.path(), "https://two.test", "author").is_ok());
-    assert!(Receipts::open(directory.path(), "https://one.test", "other").is_ok());
+    let first = Receipts::open(directory.path(), None, "https://one.test", "author").unwrap();
+    assert!(Receipts::open(directory.path(), None, "https://one.test", "author").is_err());
+    assert!(Receipts::open(directory.path(), None, "https://two.test", "author").is_ok());
+    assert!(Receipts::open(directory.path(), None, "https://one.test", "other").is_ok());
     drop(first);
-    assert!(Receipts::open(directory.path(), "https://one.test", "author").is_ok());
+    assert!(Receipts::open(directory.path(), None, "https://one.test", "author").is_ok());
 }
 
 #[test]
